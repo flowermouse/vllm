@@ -1,0 +1,19 @@
+{
+  "physical_gpu_placement": {
+    "vanilla": {
+      "gsm8k": 2,
+      "math500": 2,
+      "humaneval": 2,
+      "mbpp": 2,
+      "mt-bench": 3
+    },
+    "fixed": 0,
+    "adaptive": 1
+  },
+  "tensor_parallel_size": 1,
+  "excluded_datasets": [
+    "aime25"
+  ],
+  "benchmark_commit": "c01935becfdc3d9fa7d0f3f3d26ce636271f1e87",
+  "review_commit": "7634e54419e42e97376bf930c596e2ff13ab3791"
+}

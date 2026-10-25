@@ -1,0 +1,235 @@
+{
+  "configuration": {
+    "vllm_commit": "c01935becfdc3d9fa7d0f3f3d26ce636271f1e87",
+    "target": "Qwen/Qwen3-8B",
+    "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+    "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+    "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+    "concurrency": 64,
+    "num_prompts": 256,
+    "max_samples": 1024,
+    "repeats": 3,
+    "max_tokens": 2048,
+    "max_model_len": 8192,
+    "max_num_batched_tokens": 2048,
+    "kv_cache_gib": 32,
+    "batch_invariant": "1",
+    "seed": 42,
+    "enable_thinking": false,
+    "prefix_caching": false,
+    "backend": "TRITON_ATTN",
+    "datasets": [
+      "gsm8k",
+      "math500",
+      "humaneval",
+      "mbpp",
+      "mt-bench"
+    ]
+  },
+  "results": [
+    {
+      "dataset": "gsm8k",
+      "mode": "vanilla",
+      "mean_tps": 1271.8865719578953,
+      "stdev_tps": 6.788301179651677,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": null,
+      "mean_acceptance_length": null,
+      "truncated": 0,
+      "accuracy": {
+        "correct": 224,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "gsm8k",
+      "mode": "fixed",
+      "mean_tps": 2672.170309269769,
+      "stdev_tps": 13.265190697287549,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": 15.0,
+      "mean_acceptance_length": 7.5970738280874,
+      "truncated": 0,
+      "accuracy": {
+        "correct": 224,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "gsm8k",
+      "mode": "adaptive",
+      "mean_tps": 3128.4096279787245,
+      "stdev_tps": 36.289382989696406,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": 7.021073427724728,
+      "mean_acceptance_length": 6.489792558445835,
+      "truncated": 0,
+      "accuracy": {
+        "correct": 224,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "math500",
+      "mode": "vanilla",
+      "mean_tps": 1418.139596083881,
+      "stdev_tps": 5.5450342133514265,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": null,
+      "mean_acceptance_length": null,
+      "truncated": 46,
+      "accuracy": {
+        "correct": 154,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "math500",
+      "mode": "fixed",
+      "mean_tps": 3211.2372072933736,
+      "stdev_tps": 19.998001558986648,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": 15.0,
+      "mean_acceptance_length": 8.289325097578537,
+      "truncated": 46,
+      "accuracy": {
+        "correct": 154,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "math500",
+      "mode": "adaptive",
+      "mean_tps": 3508.883932370197,
+      "stdev_tps": 165.87994222738638,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": 7.373610797925458,
+      "mean_acceptance_length": 7.041394195148665,
+      "truncated": 46,
+      "accuracy": {
+        "correct": 154,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "humaneval",
+      "mode": "vanilla",
+      "mean_tps": 1553.6940720365392,
+      "stdev_tps": 9.352197096929666,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": null,
+      "mean_acceptance_length": null,
+      "truncated": 0,
+      "accuracy": null
+    },
+    {
+      "dataset": "humaneval",
+      "mode": "fixed",
+      "mean_tps": 2587.300966892458,
+      "stdev_tps": 1.9269003695627387,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": 15.0,
+      "mean_acceptance_length": 6.730183841579837,
+      "truncated": 0,
+      "accuracy": null
+    },
+    {
+      "dataset": "humaneval",
+      "mode": "adaptive",
+      "mean_tps": 3209.978639061528,
+      "stdev_tps": 12.447101780187117,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": 6.453016487929324,
+      "mean_acceptance_length": 5.8234043558369155,
+      "truncated": 0,
+      "accuracy": null
+    },
+    {
+      "dataset": "mbpp",
+      "mode": "vanilla",
+      "mean_tps": 1109.4374582018743,
+      "stdev_tps": 2.0498677164724723,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": null,
+      "mean_acceptance_length": null,
+      "truncated": 6,
+      "accuracy": null
+    },
+    {
+      "dataset": "mbpp",
+      "mode": "fixed",
+      "mean_tps": 2539.971372040381,
+      "stdev_tps": 0.23909682474680585,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": 15.0,
+      "mean_acceptance_length": 6.694819758218916,
+      "truncated": 6,
+      "accuracy": null
+    },
+    {
+      "dataset": "mbpp",
+      "mode": "adaptive",
+      "mean_tps": 3307.1286785792986,
+      "stdev_tps": 11.60335588185351,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": 6.154210427606902,
+      "mean_acceptance_length": 5.735324456114029,
+      "truncated": 6,
+      "accuracy": null
+    },
+    {
+      "dataset": "mt-bench",
+      "mode": "vanilla",
+      "mean_tps": 1298.9808479494534,
+      "stdev_tps": 8.540148209016882,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": null,
+      "mean_acceptance_length": null,
+      "truncated": 0,
+      "accuracy": null
+    },
+    {
+      "dataset": "mt-bench",
+      "mode": "fixed",
+      "mean_tps": 1255.559329754989,
+      "stdev_tps": 0.5959239505354245,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": 15.0,
+      "mean_acceptance_length": 3.271532027471206,
+      "truncated": 0,
+      "accuracy": null
+    },
+    {
+      "dataset": "mt-bench",
+      "mode": "adaptive",
+      "mean_tps": 1841.7366727978897,
+      "stdev_tps": 2.0352868224922167,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_verified_drafts": 2.372490445020428,
+      "mean_acceptance_length": 2.649914334665905,
+      "truncated": 0,
+      "accuracy": null
+    }
+  ]
+}
