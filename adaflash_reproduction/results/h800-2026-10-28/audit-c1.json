@@ -1,0 +1,17 @@
+{
+  "verification_steps": 75,
+  "request_steps": 75,
+  "actual_mean_verified_drafts": 5.64,
+  "actual_min_verified_drafts": 0,
+  "actual_max_verified_drafts": 13,
+  "shortened_request_steps": 75,
+  "wait_calls": 83,
+  "wait_ms_total": 525.1766997389495,
+  "wait_ms_mean": 6.327430117336742,
+  "wait_ms_max": 7.263059262186289,
+  "concurrency": 1,
+  "seconds": 0.9686000649817288,
+  "output_tokens": 369,
+  "instrumented": true,
+  "note": "Instrumentation run; not used for uninstrumented throughput claims."
+}

@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="2" time="53.442" timestamp="2026-10-28T13:35:42.988307+08:00"><testcase classname="tests.v1.e2e.spec_decode.acceptance_rates.dflash.test_dflash" name="test_adaflash_checkpoint_generation[False]" time="21.727" /><testcase classname="tests.v1.e2e.spec_decode.acceptance_rates.dflash.test_dflash" name="test_adaflash_checkpoint_generation[True]" time="20.126" /></testsuite></testsuites>

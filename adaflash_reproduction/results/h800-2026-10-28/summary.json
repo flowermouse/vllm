@@ -1,0 +1,235 @@
+{
+  "configuration": {
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "target": "Qwen/Qwen3-8B",
+    "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+    "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+    "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+    "concurrency": 64,
+    "num_prompts": 256,
+    "max_samples": 1024,
+    "repeats": 3,
+    "max_tokens": 2048,
+    "max_model_len": 8192,
+    "max_num_batched_tokens": 2048,
+    "kv_cache_gib": 32,
+    "batch_invariant": "1",
+    "seed": 42,
+    "enable_thinking": false,
+    "prefix_caching": false,
+    "backend": "TRITON_ATTN",
+    "datasets": [
+      "gsm8k",
+      "math500",
+      "humaneval",
+      "mbpp",
+      "mt-bench"
+    ]
+  },
+  "results": [
+    {
+      "dataset": "gsm8k",
+      "mode": "vanilla",
+      "mean_tps": 5012.436951504212,
+      "stdev_tps": 197.07750035178475,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": null,
+      "mean_acceptance_length": null,
+      "truncated": 0,
+      "accuracy": {
+        "correct": 220,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "gsm8k",
+      "mode": "fixed",
+      "mean_tps": 8273.444336627368,
+      "stdev_tps": 17.552684480097174,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": 15.0,
+      "mean_acceptance_length": 7.618297455968689,
+      "truncated": 0,
+      "accuracy": {
+        "correct": 220,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "gsm8k",
+      "mode": "adaptive",
+      "mean_tps": 8889.257888976419,
+      "stdev_tps": 5.531999077591873,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": 15.0,
+      "mean_acceptance_length": 6.49991641591441,
+      "truncated": 0,
+      "accuracy": {
+        "correct": 220,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "math500",
+      "mode": "vanilla",
+      "mean_tps": 4426.865939166301,
+      "stdev_tps": 75.66864300288063,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": null,
+      "mean_acceptance_length": null,
+      "truncated": 45,
+      "accuracy": {
+        "correct": 154,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "math500",
+      "mode": "fixed",
+      "mean_tps": 9768.965847692234,
+      "stdev_tps": 23.701742070289477,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": 15.0,
+      "mean_acceptance_length": 8.755317532664844,
+      "truncated": 45,
+      "accuracy": {
+        "correct": 154,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "math500",
+      "mode": "adaptive",
+      "mean_tps": 9795.752450155876,
+      "stdev_tps": 17.63392473205182,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": 15.0,
+      "mean_acceptance_length": 7.523051788923379,
+      "truncated": 45,
+      "accuracy": {
+        "correct": 154,
+        "total": 256,
+        "evaluator": "repository normalized extracted-answer exact match"
+      }
+    },
+    {
+      "dataset": "humaneval",
+      "mode": "vanilla",
+      "mean_tps": 4768.0503069258875,
+      "stdev_tps": 8.91420229476086,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": null,
+      "mean_acceptance_length": null,
+      "truncated": 0,
+      "accuracy": null
+    },
+    {
+      "dataset": "humaneval",
+      "mode": "fixed",
+      "mean_tps": 7401.51020495951,
+      "stdev_tps": 1.196892747885001,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": 15.0,
+      "mean_acceptance_length": 6.673753196930947,
+      "truncated": 0,
+      "accuracy": null
+    },
+    {
+      "dataset": "humaneval",
+      "mode": "adaptive",
+      "mean_tps": 8465.858120749968,
+      "stdev_tps": 25.220187314887085,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": 15.0,
+      "mean_acceptance_length": 5.770947659672585,
+      "truncated": 0,
+      "accuracy": null
+    },
+    {
+      "dataset": "mbpp",
+      "mode": "vanilla",
+      "mean_tps": 3530.02635346875,
+      "stdev_tps": 2.9804878747924777,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": null,
+      "mean_acceptance_length": null,
+      "truncated": 3,
+      "accuracy": null
+    },
+    {
+      "dataset": "mbpp",
+      "mode": "fixed",
+      "mean_tps": 6944.751636957394,
+      "stdev_tps": 4.214633701808719,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": 15.0,
+      "mean_acceptance_length": 6.566571320632522,
+      "truncated": 3,
+      "accuracy": null
+    },
+    {
+      "dataset": "mbpp",
+      "mode": "adaptive",
+      "mean_tps": 8161.47848200231,
+      "stdev_tps": 6.607119830789225,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": 15.0,
+      "mean_acceptance_length": 5.599447513812155,
+      "truncated": 3,
+      "accuracy": null
+    },
+    {
+      "dataset": "mt-bench",
+      "mode": "vanilla",
+      "mean_tps": 3820.957401545809,
+      "stdev_tps": 7.33376547642927,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": null,
+      "mean_acceptance_length": null,
+      "truncated": 3,
+      "accuracy": null
+    },
+    {
+      "dataset": "mt-bench",
+      "mode": "fixed",
+      "mean_tps": 3688.06093478414,
+      "stdev_tps": 8.61471782317462,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": 15.0,
+      "mean_acceptance_length": 3.311877231310279,
+      "truncated": 3,
+      "accuracy": null
+    },
+    {
+      "dataset": "mt-bench",
+      "mode": "adaptive",
+      "mean_tps": 4956.48599428399,
+      "stdev_tps": 13.117100909961454,
+      "exact_matches": 256,
+      "requests": 256,
+      "mean_scheduled_drafts": 15.0,
+      "mean_acceptance_length": 2.6394916370900896,
+      "truncated": 3,
+      "accuracy": null
+    }
+  ]
+}

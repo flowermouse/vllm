@@ -1,0 +1,47 @@
+{
+  "gsm8k": {
+    "repository": "openai/gsm8k",
+    "revision": "740312add88f781978c0658806c59bc2815b9866",
+    "config": "main",
+    "split": "test",
+    "rows": 1319,
+    "sha256": "7b07da7aa1c9faaacbd712aad177ed5f0f3a470e85a8882cae4e1e0e2f6ce613",
+    "selection": "full split"
+  },
+  "math500": {
+    "repository": "HuggingFaceH4/MATH-500",
+    "revision": "6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be",
+    "config": null,
+    "split": "test",
+    "rows": 50,
+    "sha256": "ee0e5ba6b0b560cc075010e7ea9413206e14c213f681065f4f42fd4836a7913c",
+    "selection": "indices 450:500"
+  },
+  "humaneval": {
+    "repository": "openai/openai_humaneval",
+    "revision": "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544",
+    "config": null,
+    "split": "test",
+    "rows": 164,
+    "sha256": "1acbe33b758057addd82be8d52be192af1abe2f9f11723b0a65b4217ebb9792d",
+    "selection": "full split"
+  },
+  "mbpp": {
+    "repository": "google-research-datasets/mbpp",
+    "revision": "4bb6404fdc6cacfda99d4ac4205087b89d32030c",
+    "config": "full",
+    "split": "test",
+    "rows": 500,
+    "sha256": "7838753e763123e4e5646158ff502c63e1bd5084509e261f0f308a21603c4be5",
+    "selection": "full split"
+  },
+  "mt-bench": {
+    "repository": "HuggingFaceH4/mt_bench_prompts",
+    "revision": "e3a795c5e9a82ee40611c416b8a7786c73198991",
+    "config": null,
+    "split": "train",
+    "rows": 80,
+    "sha256": "62120d3a4f3913e996168d2e07b2ed915cdd2e849b6e7261940d8e0f4f2d174f",
+    "selection": "full split"
+  }
+}

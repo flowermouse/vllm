@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Reproduce AdaFlash datasets on vanilla, fixed and adaptive vLLM."""
 
 from __future__ import annotations
@@ -402,7 +405,7 @@ def summarize(args) -> None:
                     stdev_tps=result["stdev_tps"],
                     exact_matches=matches,
                     requests=len(result["outputs"]),
-                    mean_verified_drafts=proposed / drafts if drafts else None,
+                    mean_scheduled_drafts=proposed / drafts if drafts else None,
                     mean_acceptance_length=1 + accepted / drafts if drafts else None,
                     truncated=result["samples"][-1]["truncated"],
                     accuracy=result["accuracy"],

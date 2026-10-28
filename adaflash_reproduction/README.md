@@ -1,5 +1,9 @@
 # AdaFlash benchmark reproduction snapshot
 
+Latest: [H800 results and validation](results/h800-2026-10-28/README.md).
+The original A800 snapshot is preserved in [RESULTS.md](RESULTS.md),
+[summary.json](summary.json), and [execution.json](execution.json).
+
 These files snapshot the local AdaFlash benchmark implementation; original helper sources are from ZinYY/AdaFlash at 507b7aba5fbccaa99a400f161e4f2794ba6a388c. They live on a separate fork branch, outside the core vLLM PR diff.
 
 The recorded table uses implementation c01935becfdc3d9fa7d0f3f3d26ce636271f1e87. Use an installed checkout of that version for an exact match. Default datasets: GSM8K, MATH500 (50 held-out rows), HumanEval, MBPP and MT-Bench. AIME25 is excluded. See [protocol](docs/vllm_benchmarks.md) and [results](RESULTS.md).

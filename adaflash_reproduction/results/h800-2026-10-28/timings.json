@@ -1,0 +1,1091 @@
+[
+  {
+    "dataset": "gsm8k",
+    "mode": "vanilla",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "7b07da7aa1c9faaacbd712aad177ed5f0f3a470e85a8882cae4e1e0e2f6ce613",
+    "prompt_sha256": "5adf66a383b9c4f184e5ce723c53fa9a33c635e18a6e25470766928d2f4c2c1c",
+    "unique_source_rows": 1024,
+    "samples": [
+      {
+        "seconds": 16.271281426772475,
+        "output_tokens": 77856,
+        "output_tokens_per_second": 4784.872067414256,
+        "truncated": 0,
+        "metrics": {}
+      },
+      {
+        "seconds": 15.186447314918041,
+        "output_tokens": 77856,
+        "output_tokens_per_second": 5126.676330909865,
+        "truncated": 0,
+        "metrics": {}
+      },
+      {
+        "seconds": 15.189154914114624,
+        "output_tokens": 77856,
+        "output_tokens_per_second": 5125.762456188513,
+        "truncated": 0,
+        "metrics": {}
+      }
+    ],
+    "mean_tps": 5012.436951504212,
+    "stdev_tps": 197.07750035178475,
+    "accuracy": {
+      "correct": 220,
+      "total": 256,
+      "evaluator": "repository normalized extracted-answer exact match"
+    },
+    "full_json_sha256": "585d5c3f36603a220e1ea0a890d8fc7353ab6ca67abdb526acd5316bc1aaacfe"
+  },
+  {
+    "dataset": "gsm8k",
+    "mode": "fixed",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "7b07da7aa1c9faaacbd712aad177ed5f0f3a470e85a8882cae4e1e0e2f6ce613",
+    "prompt_sha256": "5adf66a383b9c4f184e5ce723c53fa9a33c635e18a6e25470766928d2f4c2c1c",
+    "unique_source_rows": 1024,
+    "samples": [
+      {
+        "seconds": 9.388137706089765,
+        "output_tokens": 77856,
+        "output_tokens_per_second": 8293.018534389144,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 10220.0,
+          "vllm:spec_decode_num_draft_tokens": 153300.0,
+          "vllm:spec_decode_num_accepted_tokens": 67639.0
+        }
+      },
+      {
+        "seconds": 9.42668877216056,
+        "output_tokens": 77856,
+        "output_tokens_per_second": 8259.103687599067,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 10220.0,
+          "vllm:spec_decode_num_draft_tokens": 153300.0,
+          "vllm:spec_decode_num_accepted_tokens": 67639.0
+        }
+      },
+      {
+        "seconds": 9.41630565514788,
+        "output_tokens": 77856,
+        "output_tokens_per_second": 8268.210787893895,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 10220.0,
+          "vllm:spec_decode_num_draft_tokens": 153300.0,
+          "vllm:spec_decode_num_accepted_tokens": 67639.0
+        }
+      }
+    ],
+    "mean_tps": 8273.444336627368,
+    "stdev_tps": 17.552684480097174,
+    "accuracy": {
+      "correct": 220,
+      "total": 256,
+      "evaluator": "repository normalized extracted-answer exact match"
+    },
+    "full_json_sha256": "9d9d6c218f1bd63f338318188031fc17635bb20e005e8b6c531fe7c0708dff8c"
+  },
+  {
+    "dataset": "gsm8k",
+    "mode": "adaptive",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "7b07da7aa1c9faaacbd712aad177ed5f0f3a470e85a8882cae4e1e0e2f6ce613",
+    "prompt_sha256": "5adf66a383b9c4f184e5ce723c53fa9a33c635e18a6e25470766928d2f4c2c1c",
+    "unique_source_rows": 1024,
+    "samples": [
+      {
+        "seconds": 8.758645920082927,
+        "output_tokens": 77856,
+        "output_tokens_per_second": 8889.045260007822,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 11964.0,
+          "vllm:spec_decode_num_draft_tokens": 179460.0,
+          "vllm:spec_decode_num_accepted_tokens": 65801.0
+        }
+      },
+      {
+        "seconds": 8.75288761779666,
+        "output_tokens": 77856,
+        "output_tokens_per_second": 8894.893136946099,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 11964.0,
+          "vllm:spec_decode_num_draft_tokens": 179460.0,
+          "vllm:spec_decode_num_accepted_tokens": 65801.0
+        }
+      },
+      {
+        "seconds": 8.763782491907477,
+        "output_tokens": 77856,
+        "output_tokens_per_second": 8883.835269975338,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 11964.0,
+          "vllm:spec_decode_num_draft_tokens": 179460.0,
+          "vllm:spec_decode_num_accepted_tokens": 65801.0
+        }
+      }
+    ],
+    "mean_tps": 8889.257888976419,
+    "stdev_tps": 5.531999077591873,
+    "accuracy": {
+      "correct": 220,
+      "total": 256,
+      "evaluator": "repository normalized extracted-answer exact match"
+    },
+    "full_json_sha256": "4fa54d86bba3527a76f759b9a00cd7c170d3f7b8c2636008e762bc68ea9db416"
+  },
+  {
+    "dataset": "math500",
+    "mode": "vanilla",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "ee0e5ba6b0b560cc075010e7ea9413206e14c213f681065f4f42fd4836a7913c",
+    "prompt_sha256": "5507e40a1bb8fe496368a19b3b35f1ccb2191844324987b9789613e8603b6c23",
+    "unique_source_rows": 50,
+    "samples": [
+      {
+        "seconds": 53.02769765770063,
+        "output_tokens": 230117,
+        "output_tokens_per_second": 4339.562345048987,
+        "truncated": 45,
+        "metrics": {}
+      },
+      {
+        "seconds": 51.50949886115268,
+        "output_tokens": 230117,
+        "output_tokens_per_second": 4467.467265024183,
+        "truncated": 45,
+        "metrics": {}
+      },
+      {
+        "seconds": 51.43925147224218,
+        "output_tokens": 230117,
+        "output_tokens_per_second": 4473.568207425735,
+        "truncated": 45,
+        "metrics": {}
+      }
+    ],
+    "mean_tps": 4426.865939166301,
+    "stdev_tps": 75.66864300288063,
+    "accuracy": {
+      "correct": 154,
+      "total": 256,
+      "evaluator": "repository normalized extracted-answer exact match"
+    },
+    "full_json_sha256": "bbf5b154270fdfe1c8fb0735d569fb828654906b01ae8f945483326285610d93"
+  },
+  {
+    "dataset": "math500",
+    "mode": "fixed",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "ee0e5ba6b0b560cc075010e7ea9413206e14c213f681065f4f42fd4836a7913c",
+    "prompt_sha256": "5507e40a1bb8fe496368a19b3b35f1ccb2191844324987b9789613e8603b6c23",
+    "unique_source_rows": 50,
+    "samples": [
+      {
+        "seconds": 23.49085340788588,
+        "output_tokens": 230117,
+        "output_tokens_per_second": 9796.025542552223,
+        "truncated": 45,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 26328.0,
+          "vllm:spec_decode_num_draft_tokens": 394920.0,
+          "vllm:spec_decode_num_accepted_tokens": 204182.0
+        }
+      },
+      {
+        "seconds": 23.58001136407256,
+        "output_tokens": 230117,
+        "output_tokens_per_second": 9758.985966843738,
+        "truncated": 45,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 26328.0,
+          "vllm:spec_decode_num_draft_tokens": 394920.0,
+          "vllm:spec_decode_num_accepted_tokens": 204182.0
+        }
+      },
+      {
+        "seconds": 23.597178966738284,
+        "output_tokens": 230117,
+        "output_tokens_per_second": 9751.886033680741,
+        "truncated": 45,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 26328.0,
+          "vllm:spec_decode_num_draft_tokens": 394920.0,
+          "vllm:spec_decode_num_accepted_tokens": 204182.0
+        }
+      }
+    ],
+    "mean_tps": 9768.965847692234,
+    "stdev_tps": 23.701742070289477,
+    "accuracy": {
+      "correct": 154,
+      "total": 256,
+      "evaluator": "repository normalized extracted-answer exact match"
+    },
+    "full_json_sha256": "905cbbf4edc2dcc2159d187208485ae94d526b46c9186724b3d846e0914ead5b"
+  },
+  {
+    "dataset": "math500",
+    "mode": "adaptive",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "ee0e5ba6b0b560cc075010e7ea9413206e14c213f681065f4f42fd4836a7913c",
+    "prompt_sha256": "5507e40a1bb8fe496368a19b3b35f1ccb2191844324987b9789613e8603b6c23",
+    "unique_source_rows": 50,
+    "samples": [
+      {
+        "seconds": 23.52971520414576,
+        "output_tokens": 230117,
+        "output_tokens_per_second": 9779.84637737796,
+        "truncated": 45,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 30605.0,
+          "vllm:spec_decode_num_draft_tokens": 459075.0,
+          "vllm:spec_decode_num_accepted_tokens": 199638.0
+        }
+      },
+      {
+        "seconds": 23.498839722014964,
+        "output_tokens": 230117,
+        "output_tokens_per_second": 9792.69626595283,
+        "truncated": 45,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 30605.0,
+          "vllm:spec_decode_num_draft_tokens": 459075.0,
+          "vllm:spec_decode_num_accepted_tokens": 199638.0
+        }
+      },
+      {
+        "seconds": 23.446122161112726,
+        "output_tokens": 230117,
+        "output_tokens_per_second": 9814.714707136838,
+        "truncated": 45,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 30605.0,
+          "vllm:spec_decode_num_draft_tokens": 459075.0,
+          "vllm:spec_decode_num_accepted_tokens": 199638.0
+        }
+      }
+    ],
+    "mean_tps": 9795.752450155876,
+    "stdev_tps": 17.63392473205182,
+    "accuracy": {
+      "correct": 154,
+      "total": 256,
+      "evaluator": "repository normalized extracted-answer exact match"
+    },
+    "full_json_sha256": "6cbe83d21001a68ef458a95f6f4e4a3e319d48dbde4b4403c05dac42944cc5fd"
+  },
+  {
+    "dataset": "humaneval",
+    "mode": "vanilla",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "1acbe33b758057addd82be8d52be192af1abe2f9f11723b0a65b4217ebb9792d",
+    "prompt_sha256": "98fda87e7621cbcba1f1ff57945d1898783fc1c4556c2a2ada3811fda0957deb",
+    "unique_source_rows": 164,
+    "samples": [
+      {
+        "seconds": 26.2395161036402,
+        "output_tokens": 125229,
+        "output_tokens_per_second": 4772.534657475144,
+        "truncated": 0,
+        "metrics": {}
+      },
+      {
+        "seconds": 26.320865048095584,
+        "output_tokens": 125229,
+        "output_tokens_per_second": 4757.784357435502,
+        "truncated": 0,
+        "metrics": {}
+      },
+      {
+        "seconds": 26.2323857373558,
+        "output_tokens": 125229,
+        "output_tokens_per_second": 4773.831905867018,
+        "truncated": 0,
+        "metrics": {}
+      }
+    ],
+    "mean_tps": 4768.0503069258875,
+    "stdev_tps": 8.91420229476086,
+    "accuracy": null,
+    "full_json_sha256": "ddd6dcd2dfcdaafd1effe97e24fed8b4e81e1f19f84db72755affcff1d39481a"
+  },
+  {
+    "dataset": "humaneval",
+    "mode": "fixed",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "1acbe33b758057addd82be8d52be192af1abe2f9f11723b0a65b4217ebb9792d",
+    "prompt_sha256": "98fda87e7621cbcba1f1ff57945d1898783fc1c4556c2a2ada3811fda0957deb",
+    "unique_source_rows": 164,
+    "samples": [
+      {
+        "seconds": 16.916509974747896,
+        "output_tokens": 125229,
+        "output_tokens_per_second": 7402.768076094624,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 18768.0,
+          "vllm:spec_decode_num_draft_tokens": 281520.0,
+          "vllm:spec_decode_num_accepted_tokens": 106485.0
+        }
+      },
+      {
+        "seconds": 16.9219564916566,
+        "output_tokens": 125229,
+        "output_tokens_per_second": 7400.385414165577,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 18768.0,
+          "vllm:spec_decode_num_draft_tokens": 281520.0,
+          "vllm:spec_decode_num_accepted_tokens": 106485.0
+        }
+      },
+      {
+        "seconds": 16.919689118862152,
+        "output_tokens": 125229,
+        "output_tokens_per_second": 7401.37712461833,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 18768.0,
+          "vllm:spec_decode_num_draft_tokens": 281520.0,
+          "vllm:spec_decode_num_accepted_tokens": 106485.0
+        }
+      }
+    ],
+    "mean_tps": 7401.51020495951,
+    "stdev_tps": 1.196892747885001,
+    "accuracy": null,
+    "full_json_sha256": "35242d59facc3a0567c90d818ca5c3e02da45bbe653a3afaf8538bbeea4a6dc1"
+  },
+  {
+    "dataset": "humaneval",
+    "mode": "adaptive",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "1acbe33b758057addd82be8d52be192af1abe2f9f11723b0a65b4217ebb9792d",
+    "prompt_sha256": "98fda87e7621cbcba1f1ff57945d1898783fc1c4556c2a2ada3811fda0957deb",
+    "unique_source_rows": 164,
+    "samples": [
+      {
+        "seconds": 14.756783196236938,
+        "output_tokens": 125229,
+        "output_tokens_per_second": 8486.199081106924,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 21685.0,
+          "vllm:spec_decode_num_draft_tokens": 325275.0,
+          "vllm:spec_decode_num_accepted_tokens": 103458.0
+        }
+      },
+      {
+        "seconds": 14.77848738571629,
+        "output_tokens": 125229,
+        "output_tokens_per_second": 8473.735960355212,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 21685.0,
+          "vllm:spec_decode_num_draft_tokens": 325275.0,
+          "vllm:spec_decode_num_accepted_tokens": 103458.0
+        }
+      },
+      {
+        "seconds": 14.841710487846285,
+        "output_tokens": 125229,
+        "output_tokens_per_second": 8437.639320787766,
+        "truncated": 0,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 21685.0,
+          "vllm:spec_decode_num_draft_tokens": 325275.0,
+          "vllm:spec_decode_num_accepted_tokens": 103458.0
+        }
+      }
+    ],
+    "mean_tps": 8465.858120749968,
+    "stdev_tps": 25.220187314887085,
+    "accuracy": null,
+    "full_json_sha256": "f9b774ed6322c37cabda728068da2e0cb73d618d0f398db23fa8b48d44250b90"
+  },
+  {
+    "dataset": "mbpp",
+    "mode": "vanilla",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "7838753e763123e4e5646158ff502c63e1bd5084509e261f0f308a21603c4be5",
+    "prompt_sha256": "069b6ec09ebf9d45d7b49fd4e535ec0ff300f285c95276efb0d229bf8ded4e16",
+    "unique_source_rows": 500,
+    "samples": [
+      {
+        "seconds": 34.4753743680194,
+        "output_tokens": 121642,
+        "output_tokens_per_second": 3528.3735776583617,
+        "truncated": 3,
+        "metrics": {}
+      },
+      {
+        "seconds": 34.47669480741024,
+        "output_tokens": 121642,
+        "output_tokens_per_second": 3528.2384427945485,
+        "truncated": 3,
+        "metrics": {}
+      },
+      {
+        "seconds": 34.42567841289565,
+        "output_tokens": 121642,
+        "output_tokens_per_second": 3533.46703995334,
+        "truncated": 3,
+        "metrics": {}
+      }
+    ],
+    "mean_tps": 3530.02635346875,
+    "stdev_tps": 2.9804878747924777,
+    "accuracy": null,
+    "full_json_sha256": "230cd21f34b3ad5f7f711cf8e031b8a225113c23acfbd65df130c50708a71880"
+  },
+  {
+    "dataset": "mbpp",
+    "mode": "fixed",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "7838753e763123e4e5646158ff502c63e1bd5084509e261f0f308a21603c4be5",
+    "prompt_sha256": "069b6ec09ebf9d45d7b49fd4e535ec0ff300f285c95276efb0d229bf8ded4e16",
+    "unique_source_rows": 500,
+    "samples": [
+      {
+        "seconds": 17.510321580339223,
+        "output_tokens": 121642,
+        "output_tokens_per_second": 6946.874130317569,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 18529.0,
+          "vllm:spec_decode_num_draft_tokens": 277935.0,
+          "vllm:spec_decode_num_accepted_tokens": 103143.0
+        }
+      },
+      {
+        "seconds": 17.527924046851695,
+        "output_tokens": 121642,
+        "output_tokens_per_second": 6939.897712635794,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 18529.0,
+          "vllm:spec_decode_num_draft_tokens": 277935.0,
+          "vllm:spec_decode_num_accepted_tokens": 103143.0
+        }
+      },
+      {
+        "seconds": 17.508786824066192,
+        "output_tokens": 121642,
+        "output_tokens_per_second": 6947.48306791882,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 18529.0,
+          "vllm:spec_decode_num_draft_tokens": 277935.0,
+          "vllm:spec_decode_num_accepted_tokens": 103143.0
+        }
+      }
+    ],
+    "mean_tps": 6944.751636957394,
+    "stdev_tps": 4.214633701808719,
+    "accuracy": null,
+    "full_json_sha256": "bd355a7ddda119a013a8e488f305b8e1daf59e8f144607e223b25878fd4de56b"
+  },
+  {
+    "dataset": "mbpp",
+    "mode": "adaptive",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "7838753e763123e4e5646158ff502c63e1bd5084509e261f0f308a21603c4be5",
+    "prompt_sha256": "069b6ec09ebf9d45d7b49fd4e535ec0ff300f285c95276efb0d229bf8ded4e16",
+    "unique_source_rows": 500,
+    "samples": [
+      {
+        "seconds": 14.898529273923486,
+        "output_tokens": 121642,
+        "output_tokens_per_second": 8164.69852584086,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 21720.0,
+          "vllm:spec_decode_num_draft_tokens": 325800.0,
+          "vllm:spec_decode_num_accepted_tokens": 99900.0
+        }
+      },
+      {
+        "seconds": 14.918298989068717,
+        "output_tokens": 121642,
+        "output_tokens_per_second": 8153.878675386005,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 21720.0,
+          "vllm:spec_decode_num_draft_tokens": 325800.0,
+          "vllm:spec_decode_num_accepted_tokens": 99900.0
+        }
+      },
+      {
+        "seconds": 14.89641337795183,
+        "output_tokens": 121642,
+        "output_tokens_per_second": 8165.858244780064,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 21720.0,
+          "vllm:spec_decode_num_draft_tokens": 325800.0,
+          "vllm:spec_decode_num_accepted_tokens": 99900.0
+        }
+      }
+    ],
+    "mean_tps": 8161.47848200231,
+    "stdev_tps": 6.607119830789225,
+    "accuracy": null,
+    "full_json_sha256": "191f8b06a0f344240d3218e01732751ccce82567acbd38544acc5f62db9935d1"
+  },
+  {
+    "dataset": "mt-bench",
+    "mode": "vanilla",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "62120d3a4f3913e996168d2e07b2ed915cdd2e849b6e7261940d8e0f4f2d174f",
+    "prompt_sha256": "de9b39bce103644fa4296f52a3c44caabe492b4c6c3b24c5a1ae52a16d2ff282",
+    "unique_source_rows": 80,
+    "samples": [
+      {
+        "seconds": 32.530464637093246,
+        "output_tokens": 124295,
+        "output_tokens_per_second": 3820.8799470472723,
+        "truncated": 3,
+        "metrics": {}
+      },
+      {
+        "seconds": 32.59202786209062,
+        "output_tokens": 124295,
+        "output_tokens_per_second": 3813.662670084226,
+        "truncated": 3,
+        "metrics": {}
+      },
+      {
+        "seconds": 32.46716280793771,
+        "output_tokens": 124295,
+        "output_tokens_per_second": 3828.3295875059284,
+        "truncated": 3,
+        "metrics": {}
+      }
+    ],
+    "mean_tps": 3820.957401545809,
+    "stdev_tps": 7.33376547642927,
+    "accuracy": null,
+    "full_json_sha256": "09cdd08ebf4906b681df5d80082c00a2dcd531065fcaa00497f3ba4244eddbbf"
+  },
+  {
+    "dataset": "mt-bench",
+    "mode": "fixed",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "62120d3a4f3913e996168d2e07b2ed915cdd2e849b6e7261940d8e0f4f2d174f",
+    "prompt_sha256": "de9b39bce103644fa4296f52a3c44caabe492b4c6c3b24c5a1ae52a16d2ff282",
+    "unique_source_rows": 80,
+    "samples": [
+      {
+        "seconds": 33.79308247473091,
+        "output_tokens": 124295,
+        "output_tokens_per_second": 3678.119629747974,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 37534.0,
+          "vllm:spec_decode_num_draft_tokens": 563010.0,
+          "vllm:spec_decode_num_accepted_tokens": 86774.0
+        }
+      },
+      {
+        "seconds": 33.6593831339851,
+        "output_tokens": 124295,
+        "output_tokens_per_second": 3692.7295876228404,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 37534.0,
+          "vllm:spec_decode_num_draft_tokens": 563010.0,
+          "vllm:spec_decode_num_accepted_tokens": 86774.0
+        }
+      },
+      {
+        "seconds": 33.653878555167466,
+        "output_tokens": 124295,
+        "output_tokens_per_second": 3693.333586981606,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 37534.0,
+          "vllm:spec_decode_num_draft_tokens": 563010.0,
+          "vllm:spec_decode_num_accepted_tokens": 86774.0
+        }
+      }
+    ],
+    "mean_tps": 3688.06093478414,
+    "stdev_tps": 8.61471782317462,
+    "accuracy": null,
+    "full_json_sha256": "ada3575b637ef619e3c709be6fc1d1a28def91326adc9a7a1f8b609135575924"
+  },
+  {
+    "dataset": "mt-bench",
+    "mode": "adaptive",
+    "configuration": {
+      "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+      "target": "Qwen/Qwen3-8B",
+      "target_revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "draft": "AdaFlash/Qwen3-8B-AdaFlash",
+      "draft_revision": "6d9b5c2fd6a0c7bab8436bbca67c380dcdfc547f",
+      "concurrency": 64,
+      "num_prompts": 256,
+      "max_samples": 1024,
+      "repeats": 3,
+      "max_tokens": 2048,
+      "max_model_len": 8192,
+      "max_num_batched_tokens": 2048,
+      "kv_cache_gib": 32,
+      "batch_invariant": "1",
+      "seed": 42,
+      "enable_thinking": false,
+      "prefix_caching": false,
+      "backend": "TRITON_ATTN",
+      "datasets": [
+        "gsm8k",
+        "math500",
+        "humaneval",
+        "mbpp",
+        "mt-bench"
+      ]
+    },
+    "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+    "gpu": "NVIDIA H800",
+    "data_sha256": "62120d3a4f3913e996168d2e07b2ed915cdd2e849b6e7261940d8e0f4f2d174f",
+    "prompt_sha256": "de9b39bce103644fa4296f52a3c44caabe492b4c6c3b24c5a1ae52a16d2ff282",
+    "unique_source_rows": 80,
+    "samples": [
+      {
+        "seconds": 25.14987823786214,
+        "output_tokens": 124295,
+        "output_tokens_per_second": 4942.17104450545,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 47053.0,
+          "vllm:spec_decode_num_draft_tokens": 705795.0,
+          "vllm:spec_decode_num_accepted_tokens": 77143.0
+        }
+      },
+      {
+        "seconds": 25.01947746798396,
+        "output_tokens": 124295,
+        "output_tokens_per_second": 4967.929492494534,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 47053.0,
+          "vllm:spec_decode_num_draft_tokens": 705795.0,
+          "vllm:spec_decode_num_accepted_tokens": 77143.0
+        }
+      },
+      {
+        "seconds": 25.062722612172365,
+        "output_tokens": 124295,
+        "output_tokens_per_second": 4959.357445851988,
+        "truncated": 3,
+        "metrics": {
+          "vllm:spec_decode_num_drafts": 47053.0,
+          "vllm:spec_decode_num_draft_tokens": 705795.0,
+          "vllm:spec_decode_num_accepted_tokens": 77143.0
+        }
+      }
+    ],
+    "mean_tps": 4956.48599428399,
+    "stdev_tps": 13.117100909961454,
+    "accuracy": null,
+    "full_json_sha256": "1218abc148e61d89669cad4f3176d7a0ea55dea2953ab3da796f31e1d10672c3"
+  }
+]

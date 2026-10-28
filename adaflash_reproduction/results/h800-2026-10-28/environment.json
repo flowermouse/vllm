@@ -1,0 +1,20 @@
+{
+  "python": "3.12.13",
+  "packages": {
+    "torch": "2.14.0",
+    "triton": "3.8.0",
+    "transformers": "5.20.2",
+    "datasets": "3.6.0",
+    "huggingface-hub": "2.3.0",
+    "pydantic": "2.14.1",
+    "flashinfer-python": "0.7.2.post1",
+    "vllm": "0.1.dev24006+g0499c8077.precompiled"
+  },
+  "cuda_runtime": "13.0",
+  "gpu": "NVIDIA H800",
+  "driver": "570.124.06",
+  "vllm_commit": "0499c8077307edb4c40a32d3f432cbb54c794e2e",
+  "precompiled_artifact_commit": "68eca9af01b8b323667cb4b87148547e8b98eef6",
+  "cuda_compat": "13.0.2 (implementation 580.95.05)",
+  "measured_modes": "Serial jobs on the same single H800; TP1; BF16"
+}
