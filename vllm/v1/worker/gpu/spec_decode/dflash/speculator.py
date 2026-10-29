@@ -87,6 +87,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 "is the bonus token."
             )
         self.sample_from_anchor = False
+        # Query tokens that share one logical position (a slot and its scratch tokens);
+        # 1 for DFlash and DSpark. Only subclasses with scratch tokens raise it.
+        self.group_size = 1
 
         # Context positions for the K/V precompute, populated by prepare_dflash_inputs.
         self.context_positions = torch.zeros(
@@ -545,6 +548,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
                 num_reqs,
+                self.group_size,
             )
 
         if num_speculative_tokens == 0:
@@ -678,6 +682,7 @@ def _prepare_dflash_inputs_kernel(
     max_model_len,
     cp_rank,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
@@ -743,9 +748,15 @@ def _prepare_dflash_inputs_kernel(
     tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
 
     # --- Query positions / input_ids / slots ---
+    # query_pos is where the token's K/V lives in the cache (one cache slot per query
+    # token). With GROUP_SIZE > 1 the tokens of a group (a slot and its scratch tokens)
+    # share the logical position of the slot, `logical_pos`, which is what RoPE sees and
+    # what sampling is keyed by; for GROUP_SIZE == 1 the two are the same.
     query_pos = last_valid_pos + 1 + query_off
+    slot_off = query_off // GROUP_SIZE
+    logical_pos = last_valid_pos + 1 + slot_off
     query_idx = query_base + query_off
-    is_bonus = is_query & (query_off == 0)
+    is_bonus = is_query & (slot_off == 0)
     input_id = tl.where(is_bonus, bonus_token, parallel_drafting_token_id)
 
     q_block_num = query_pos // (block_size * CP_SIZE)
@@ -775,7 +786,7 @@ def _prepare_dflash_inputs_kernel(
 
     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
     tl.store(out_is_padding_ptr + query_idx, False, mask=is_query)
-    clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
+    clamped_query_pos = tl.minimum(logical_pos, max_model_len - 1)
     tl.store(out_query_positions_ptr + query_idx, clamped_query_pos, mask=is_query)
     tl.store(out_query_slot_mapping_ptr + query_idx, q_slot, mask=is_query)
 
@@ -784,10 +795,11 @@ def _prepare_dflash_inputs_kernel(
     # and each position k predicts the NEXT token (sampled position = query_pos + 1).
     # Otherwise (DFlash default) the anchor is the bonus token and only the mask tokens
     # at offsets > 0 are sampled from, each AT its own position.
+    # With GROUP_SIZE > 1 only the first token of a group (the slot) is sampled.
     sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
-    is_sample = is_query & (query_off >= sample_off)
-    sample_idx = req_idx * num_speculative_steps + (query_off - sample_off)
-    sample_pos = query_pos + 1 if SAMPLE_FROM_ANCHOR else query_pos
+    is_sample = is_query & (slot_off >= sample_off) & (query_off % GROUP_SIZE == 0)
+    sample_idx = req_idx * num_speculative_steps + (slot_off - sample_off)
+    sample_pos = logical_pos + 1 if SAMPLE_FROM_ANCHOR else logical_pos
     tl.store(out_sample_indices_ptr + sample_idx, query_idx, mask=is_sample)
     tl.store(out_sample_pos_ptr + sample_idx, sample_pos, mask=is_sample)
     tl.store(out_sample_idx_mapping_ptr + sample_idx, req_state_idx, mask=is_sample)
@@ -880,6 +892,7 @@ def prepare_dflash_inputs(
     max_model_len: int,
     sample_from_anchor: bool = False,
     num_reqs_override: int | None = None,
+    group_size: int = 1,
 ) -> None:
     num_reqs = input_batch.num_reqs if num_reqs_override is None else num_reqs_override
     assert num_reqs <= input_batch.num_reqs
@@ -924,6 +937,7 @@ def prepare_dflash_inputs(
         max_model_len,
         cp_rank,
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
+        GROUP_SIZE=group_size,
         PAD_SLOT_ID=PAD_SLOT_ID,
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,

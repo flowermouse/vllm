@@ -231,6 +231,21 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
+        # A draft with scratch tokens (a slot plus r tokens that share its position, see
+        # models/qwen3_dflash_selector.py) needs the group-causal mask inside its query
+        # block; that is a FlashAttention variant, not a different cache layout.
+        group_size = 1
+        attn_backend = None
+        speculative_config = get_current_vllm_config().speculative_config
+        if speculative_config is not None:
+            draft_hf_config = speculative_config.draft_model_config.hf_config
+            group_size = 1 + int(getattr(draft_hf_config, "num_scratch_tokens", 0) or 0)
+        if group_size > 1:
+            from vllm.v1.attention.backends.group_causal_flash_attn import (
+                GroupCausalFlashAttentionBackend,
+            )
+
+            attn_backend = GroupCausalFlashAttentionBackend
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -242,7 +257,12 @@ class DFlashQwen3Attention(nn.Module):
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
             sinks=self.attention_sink_bias,
+            attn_backend=attn_backend,
         )
+        if group_size > 1:
+            assert speculative_config is not None
+            self.attn.group_size = group_size
+            self.attn.query_len = speculative_config.num_speculative_tokens * group_size
         self.causal = causal
         if current_platform.is_rocm():
             from vllm.platforms.rocm import on_gfx1x
