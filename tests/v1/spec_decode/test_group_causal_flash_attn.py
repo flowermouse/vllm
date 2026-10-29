@@ -10,7 +10,6 @@ pseudo-requests on the stock FlashAttention path.
 import math
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
@@ -18,7 +17,16 @@ from vllm.v1.attention.backends.group_causal_flash_attn import (
     GroupCausalFlashAttentionImpl,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+try:  # collected by pytest where it exists; also runs as a plain script (the evaluation env has no pytest)
+    import pytest
+
+    pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+    _parametrize = pytest.mark.parametrize
+except ImportError:
+
+    def _parametrize(name, values):
+        return lambda fn: fn
+
 
 H, KV, D, BLOCK = 32, 8, 128, 16
 
@@ -37,7 +45,7 @@ def _reference(q, k_all, v_all, ctx, groups, g):
     return torch.einsum("hqk,khd->qhd", scores.softmax(dim=-1), v)
 
 
-@pytest.mark.parametrize("group_size", [1, 2, 4])
+@_parametrize("group_size", [1, 2, 4])
 def test_group_causal_matches_dense_reference(group_size):
     torch.manual_seed(0)
     dev = torch.device("cuda")
