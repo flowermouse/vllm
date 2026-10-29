@@ -642,7 +642,18 @@ class VllmConfig:
         if speculative_config.use_dflash() or dspark_fill_in:
             # Fill-in drafting uses a bonus query plus one query per draft token.
             # DSpark's anchor-sampling layout does not need the extra slot.
-            return self.num_speculative_tokens + 1
+            lookahead = self.num_speculative_tokens + 1
+            # A draft with scratch tokens (AngelSpec E7) gives every slot r extra query
+            # tokens, each with a KV slot of its own after the context.
+            num_scratch = int(
+                getattr(
+                    speculative_config.draft_model_config.hf_config,
+                    "num_scratch_tokens",
+                    0,
+                )
+                or 0
+            )
+            return max(lookahead, self.num_speculative_tokens * (1 + num_scratch))
         if speculative_config.use_eagle() or speculative_config.uses_draft_model():
             # Anchor-sampling DSpark drafts a block of num_speculative_tokens
             # query tokens in which the anchor itself is the first prediction
