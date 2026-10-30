@@ -45,6 +45,10 @@ def init_speculator(
             )
 
             return DFlashSelectorSpeculator(vllm_config, device)
+        if "DFlashCRLDraftModel" in architectures:
+            from vllm.v1.worker.gpu.spec_decode.crl.speculator import CRLSpeculator
+
+            return CRLSpeculator(vllm_config, device)
         if {"DFlash2DraftModel", "DFlash2BeamDraftModel"}.intersection(architectures):
             from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
                 DFlash2Speculator,

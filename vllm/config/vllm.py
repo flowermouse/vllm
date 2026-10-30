@@ -790,6 +790,7 @@ class VllmConfig:
             {
                 "DFlash2DraftModel",
                 "DFlash2BeamDraftModel",
+                "DFlashCRLDraftModel",
                 "LiLiCorrDraftModel",
             }.intersection(draft_config.architectures or [])
         )

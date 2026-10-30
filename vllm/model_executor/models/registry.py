@@ -669,6 +669,8 @@ _SPECULATIVE_DECODING_MODELS = {
         "DFlashSelectorQwen3ForCausalLM",
     ),
     "DFlash2DraftModel": ("qwen3_dflash2", "DFlash2Qwen3ForCausalLM"),
+    # AngelSpec CRL: DFlash backbone (optionally with DFlash 2's convolutions) + conditional refinement layer
+    "DFlashCRLDraftModel": ("qwen3_dflash_crl", "DFlashCRLQwen3ForCausalLM"),
     "DFlash2BeamDraftModel": ("vllm.models.beam", "DFlash2BeamForCausalLM"),
     # Muse Glimmer's DFlash draft head, reusing the generic qwen3_dflash
     # implementation. EAGLEConfig rewrites a dflash draft's architecture to
