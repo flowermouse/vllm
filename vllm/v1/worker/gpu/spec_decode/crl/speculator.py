@@ -68,6 +68,8 @@ class CRLSpeculator(DFlash2Speculator):
         model = self.model.model
         crl = model.crl
         num_reqs, steps, k = candidate_ids.shape
+        if self._crl_attn_metadata is None:  # a profiling / dummy run without attention metadata: nothing to read
+            return unary_logits.view(num_reqs, steps, 1, k).float().expand(-1, -1, k, -1).contiguous()
         ka = crl.pred_topk
         d = model.config.hidden_size
         device = candidate_ids.device
