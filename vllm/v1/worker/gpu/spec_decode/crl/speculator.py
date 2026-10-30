@@ -10,11 +10,13 @@ implementation with a rebuilt query layout -- no new kernel, static shapes, no h
 """
 
 import dataclasses
+import os
 
 import torch
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
 logger = init_logger(__name__)
@@ -26,6 +28,8 @@ class CRLSpeculator(DFlash2Speculator):
     def __init__(self, vllm_config, device):
         super().__init__(vllm_config, device)
         self._crl_attn_metadata = None
+        # a measurement switch: score the plain logits and skip the refinement layer (the cost of the stage = the per-round time difference)
+        self._skip_stage = os.environ.get("VLLM_CRL_SKIP_STAGE", "0") == "1"
         logger.info(
             "%s: %d rows, top-%d candidates, %d predecessors per row",
             self._speculator_name,
@@ -33,6 +37,12 @@ class CRLSpeculator(DFlash2Speculator):
             self.top_k,
             int(self.draft_model_config.hf_config.dflash_config["crl_pred_topk"]),
         )
+
+    def load_draft_model(self, target_model, target_attn_layer_names):
+        model = super().load_draft_model(target_model, target_attn_layer_names)
+        # the target's (frozen) input embedding is shared with the draft by now: tabulate W_e RMSNorm_e(E_in) once
+        model.model.crl.build_inference_buffers(model.model.embed_tokens.weight)
+        return model
 
     def _generate_draft(
         self,
@@ -68,7 +78,7 @@ class CRLSpeculator(DFlash2Speculator):
         model = self.model.model
         crl = model.crl
         num_reqs, steps, k = candidate_ids.shape
-        if self._crl_attn_metadata is None:  # a profiling / dummy run without attention metadata: nothing to read
+        if self._skip_stage or self._crl_attn_metadata is None:  # a profiling / dummy run without attention metadata: nothing to read
             return unary_logits.view(num_reqs, steps, 1, k).float().expand(-1, -1, k, -1).contiguous()
         ka = crl.pred_topk
         d = model.config.hidden_size
@@ -81,9 +91,7 @@ class CRLSpeculator(DFlash2Speculator):
         pred = torch.cat(
             (anchor[:, None, None].expand(-1, 1, ka), candidate_ids[:, :-1, :ka]), dim=1
         )  # [R, N, ka]
-        emb = model.embed_tokens(pred.reshape(-1)).view(num_reqs * steps, ka, d)
         h = h_pre.expand(-1, ka, -1).reshape(-1, d)
-        emb = emb.reshape(-1, d)
         positions = (
             self.sample_pos[: num_reqs * steps]
             .view(num_reqs * steps, 1)
@@ -122,8 +130,10 @@ class CRLSpeculator(DFlash2Speculator):
             )
             return out
 
-        r = crl(h, emb, rope, attend)  # [R * N * ka, D]
-        x = RMSNormOnly.apply(model.norm, r).view(num_reqs, steps, ka, d)
+        down, r = crl(h, pred.reshape(-1), rope, attend)  # [R * N * ka, D] each
+        # final norm of r'' = r' + down: the add is fused into the norm (the base-class call, not the pre-norm variant)
+        x, _ = RMSNorm.forward(model.norm, down, r)
+        x = x.view(num_reqs, steps, ka, d)
         lm_weight = self.model.lm_head.weight
         w = lm_weight[candidate_ids]  # [R, N, K, D]
         scores = torch.einsum("rnad,rnkd->rnak", x, w).float()
@@ -131,12 +141,3 @@ class CRLSpeculator(DFlash2Speculator):
         table[:, :, :ka, :] = scores
         return table
 
-
-class RMSNormOnly:
-    """The final norm applied to ``r''`` alone (the model's ``norm`` is the one that also returns the pre-norm sum)."""
-
-    @staticmethod
-    def apply(norm: torch.nn.Module, r: torch.Tensor) -> torch.Tensor:
-        x = r.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon)
-        return x.to(r.dtype) * norm.weight

@@ -28,6 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -37,7 +38,15 @@ from .qwen3_dflash2 import DFlash2Qwen3DecoderLayer
 
 
 class CRLayer(nn.Module):
-    """The refinement layer. Parameter names are AngelSpec's (``layers.{L-1}.crl.*``)."""
+    """The refinement layer. Parameter names are AngelSpec's (``layers.{L-1}.crl.*``).
+
+    Inference form (``build_inference_buffers``, called once the target embedding is shared):
+
+    * ``emb_table[a] = W_e RMSNorm_e(E_in[a])`` for the whole vocabulary: the embedding is frozen, so the predecessor
+      term of the first sum is a gather instead of a 4096 x 4096 matmul plus a norm (exactly the same numbers);
+    * the gate and up projections are one ``[2 * hidden, D]`` matmul followed by the fused ``SiluAndMul``;
+    * every residual add is fused into the RMSNorm that follows it (``norm(x, residual)``).
+    """
 
     def __init__(self, config, draft_config: dict) -> None:
         super().__init__()
@@ -57,18 +66,37 @@ class CRLayer(nn.Module):
         self.gate_proj = nn.Linear(d, hidden, bias=False)
         self.up_proj = nn.Linear(d, hidden, bias=False)
         self.down_proj = nn.Linear(hidden, d, bias=False)
+        self.act = SiluAndMul()
+        self.emb_table: torch.Tensor | None = None
+        self.gate_up_weight: torch.Tensor | None = None
 
-    def forward(self, h: torch.Tensor, emb: torch.Tensor, rope, attend) -> torch.Tensor:
-        """``h`` / ``emb`` ``[N, D]`` (the row's last-layer output and the predecessor's input embedding) -> ``r''`` ``[N, D]``.
+    @torch.no_grad()
+    def build_inference_buffers(self, embed_weight: torch.Tensor, chunk: int = 8192) -> None:
+        vocab, d = embed_weight.shape
+        table = torch.empty(vocab, d, dtype=embed_weight.dtype, device=embed_weight.device)
+        for c0 in range(0, vocab, chunk):
+            table[c0 : c0 + chunk] = self.w_e(self.norm_e(embed_weight[c0 : c0 + chunk]))
+        self.emb_table = table
+        hidden = self.gate_proj.out_features
+        merged = torch.cat((self.gate_proj.weight.data, self.up_proj.weight.data), dim=0)
+        self.gate_up_weight = merged
+        # the two modules keep views of the merged tensor (no second copy of the weights)
+        self.gate_proj.weight.data = merged[:hidden]
+        self.up_proj.weight.data = merged[hidden:]
+
+    def forward(self, h: torch.Tensor, pred_ids: torch.Tensor, rope, attend) -> tuple[torch.Tensor, torch.Tensor]:
+        """``h`` ``[N, D]`` the rows' last-layer outputs, ``pred_ids`` ``[N]`` the predecessor tokens -> ``(down, r')``: the MLP output and the
+        residual stream before it, so that the caller's final norm can fuse the last add (``r'' = r' + down``).
         ``rope(q)`` rotates ``q`` ``[N, H * Dh]`` in place at the rows' positions, ``attend(q)`` ``[N, H, Dh]`` -> ``[N, H, Dh]``."""
-        r = h + self.w_e(self.norm_e(emb))
-        q = self.q_proj(self.norm1(r))
+        # r = h + W_e RMSNorm_e(E[a]); x1 = RMSNorm_1(r)
+        x1, r = self.norm1(h, self.emb_table[pred_ids])
+        q = self.q_proj(x1)
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).reshape(q.shape)
         rope(q)
         o = attend(q.view(-1, self.num_heads, self.head_dim))
-        r = r + self.o_proj(o.reshape(o.shape[0], -1))
-        x = self.norm2(r)
-        return r + self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        # r' = r + o_proj(o); x2 = RMSNorm_2(r')
+        x2, r = self.norm2(self.o_proj(o.reshape(o.shape[0], -1)), r)
+        return self.down_proj(self.act(F.linear(x2, self.gate_up_weight))), r
 
 
 class _NormWithPre(RMSNorm):
