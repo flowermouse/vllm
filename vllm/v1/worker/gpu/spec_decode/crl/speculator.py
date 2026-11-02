@@ -31,11 +31,14 @@ class CRLSpeculator(DFlash2Speculator):
         # a measurement switch: score the plain logits and skip the refinement layer (the cost of the stage = the per-round time difference)
         self._skip_stage = os.environ.get("VLLM_CRL_SKIP_STAGE", "0") == "1"
         logger.info(
-            "%s: %d rows, top-%d candidates, %d predecessors per row",
+            "%s: %d rows, top-%d candidates, %d predecessors per row; at temperature > 0 the drafts are %s",
             self._speculator_name,
             self.num_speculative_steps,
             self.top_k,
             int(self.draft_model_config.hf_config.dflash_config["crl_pred_topk"]),
+            "sampled from the cached proposal (draft_sample_method=probabilistic)"
+            if self.use_draft_logits
+            else "the argmax walk with one-hot proposals (draft_sample_method=greedy)",
         )
 
     def load_draft_model(self, target_model, target_attn_layer_names):
