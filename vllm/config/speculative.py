@@ -631,6 +631,13 @@ class SpeculativeConfig:
             )
         return SpeculativeConfig._acceptance_length_to_rates(length, n)
 
+    crl_pred_topk: int | None = None
+    """CRL / RAL drafts only: the number K_a of predecessor candidates of the
+    previous row that the refinement layer scores (the rest fall back to the
+    row's own logits). It is an inference-time knob (training conditions on the
+    real predecessor), so it overrides the exported draft config's
+    ``crl_pred_topk`` (the default) when set. 1 <= K_a <= ``selector_top_k``."""
+
     draft_sample_method: DraftSampleMethod = "greedy"
     """How the draft model samples tokens. 'greedy' always picks the argmax
     token, and the draft probabilities are treated as one-hot during rejection
@@ -1160,6 +1167,22 @@ class SpeculativeConfig:
 
         return hf_config
 
+    def _override_crl_pred_topk(self, hf_config: PreTrainedConfig) -> None:
+        """Write ``crl_pred_topk`` into the draft config, where both the model (CRLayer) and the speculator read it."""
+        dflash_config = getattr(hf_config, "dflash_config", None)
+        if not isinstance(dflash_config, dict) or "crl_pred_topk" not in dflash_config:
+            raise ValueError(
+                "crl_pred_topk is set, but the draft is not a CRL / RAL draft (no dflash_config.crl_pred_topk)."
+            )
+        candidates = int(dflash_config.get("selector_top_k", 16))
+        if not 1 <= self.crl_pred_topk <= candidates:
+            raise ValueError(
+                f"crl_pred_topk must be in [1, selector_top_k={candidates}], got {self.crl_pred_topk}."
+            )
+        dflash_config["crl_pred_topk"] = self.crl_pred_topk
+        if hasattr(hf_config, "crl_pred_topk"):
+            hf_config.crl_pred_topk = self.crl_pred_topk
+
     @staticmethod
     def _apply_composed_hf_override(
         target_hf_overrides: Callable[[PreTrainedConfig], PreTrainedConfig],
@@ -1391,6 +1414,9 @@ class SpeculativeConfig:
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,
                 )
+
+                if self.crl_pred_topk is not None:
+                    self._override_crl_pred_topk(self.draft_model_config.hf_config)
 
                 # Automatically detect the method
                 if self.method in (
