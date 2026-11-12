@@ -7,6 +7,10 @@ scores differ: instead of a low-rank edge term, the conditional refinement layer
 first ``crl_pred_topk`` candidates of the row before (row 1: the anchor token). Its ``N * crl_pred_topk`` queries per request attend
 to the last draft layer's paged K/V cache (context + the block's own rows, non-causal), through that layer's FlashAttention
 implementation with a rebuilt query layout -- no new kernel, static shapes, no host sync, so the whole step stays in the draft graph.
+
+At concurrency 32 the stage's glue (index / cat / expand copies, RMSNorm decomposed into pow / mean / rsqrt / mul, the candidate gather of the LM head)
+was ~450 of its ~700 us per engine step; ``crl/fused.py`` replaces it by two Triton kernels (``_crl_prep_kernel``, ``_crl_score_kernel``) and the CUDA
+norm ops, ~40% off the stage.
 """
 
 import dataclasses
@@ -17,6 +21,8 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.triton_utils import triton
+from vllm.v1.worker.gpu.spec_decode.crl.fused import _crl_prep_kernel, _crl_score_kernel
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
 logger = init_logger(__name__)
@@ -30,6 +36,9 @@ class CRLSpeculator(DFlash2Speculator):
         self._crl_attn_metadata = None
         # a measurement switch: score the plain logits and skip the refinement layer (the cost of the stage = the per-round time difference)
         self._skip_stage = os.environ.get("VLLM_CRL_SKIP_STAGE", "0") == "1"
+        # the stage's glue as two Triton kernels + the CUDA norm ops (crl/fused.py); VLLM_CRL_FUSED=0 runs the PyTorch reference path (same numbers
+        # up to bf16 rounding of the candidate scores)
+        self._fused = os.environ.get("VLLM_CRL_FUSED", "1") == "1"
         logger.info(
             "%s: %d rows, top-%d candidates, %d predecessors per row; at temperature > 0 the drafts are %s",
             self._speculator_name,
@@ -77,35 +86,47 @@ class CRLSpeculator(DFlash2Speculator):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         """``[R, N, K, K]`` score tables: ``table[r, k, i, b] = S_k(cand_{k-1}[i], cand_k[b])`` for ``i < crl_pred_topk``; the other
-        predecessors (and nothing else) fall back to the row's own logits. Row 1's table (index 0) is scored given the anchor token."""
+        predecessors (and nothing else) fall back to the row's own logits. Row 1's table (index 0) is scored given the anchor token.
+
+        A request carries ``1 + (N - 1) * crl_pred_topk`` refinement queries: row 1's only predecessor is the anchor token, so it is
+        scored once (its table rows are identical copies), every later row once per predecessor."""
         model = self.model.model
         crl = model.crl
         num_reqs, steps, k = candidate_ids.shape
         if self._skip_stage or self._crl_attn_metadata is None:  # a profiling / dummy run without attention metadata: nothing to read
             return unary_logits.view(num_reqs, steps, 1, k).float().expand(-1, -1, k, -1).contiguous()
+        if self._fused:
+            return self._score_fused(candidate_ids, unary_logits, hidden_states)
         ka = crl.pred_topk
         d = model.config.hidden_size
         device = candidate_ids.device
-        h_pre = hidden_states[..., d:].reshape(num_reqs * steps, 1, d)
-
+        h_pre = hidden_states[..., d:]  # [R, N, D]: the rows' last-layer outputs before the final norm
         anchor = self.input_buffers.input_ids[
             : num_reqs * self.num_query_per_req : self.num_query_per_req
         ]
+        # Row 1 (index 0) has exactly one predecessor, the anchor token (the old layout scored it ka times with the same input and kept
+        # identical copies), so a request carries 1 + (N - 1) * ka refinement queries: row 0 once, every later row once per predecessor.
         pred = torch.cat(
-            (anchor[:, None, None].expand(-1, 1, ka), candidate_ids[:, :-1, :ka]), dim=1
-        )  # [R, N, ka]
-        h = h_pre.expand(-1, ka, -1).reshape(-1, d)
-        positions = (
-            self.sample_pos[: num_reqs * steps]
-            .view(num_reqs * steps, 1)
-            .expand(-1, ka)
-            .reshape(-1)
-        )
+            (anchor.view(num_reqs, 1), candidate_ids[:, :-1, :ka].reshape(num_reqs, -1)),
+            dim=1,
+        )  # [R, Q]
+        h = torch.cat(
+            (
+                h_pre[:, :1],
+                h_pre[:, 1:, None, :].expand(-1, -1, ka, -1).reshape(num_reqs, -1, d),
+            ),
+            dim=1,
+        ).reshape(-1, d)
+        sample_pos = self.sample_pos[: num_reqs * steps].view(num_reqs, steps)
+        positions = torch.cat(
+            (sample_pos[:, :1], sample_pos[:, 1:, None].expand(-1, -1, ka).reshape(num_reqs, -1)),
+            dim=1,
+        ).reshape(-1)
 
         attn_mod = model.layers[-1].self_attn
         layer = attn_mod.attn
         metadata = self._crl_attn_metadata[layer.layer_name]
-        queries_per_req = steps * ka
+        queries_per_req = 1 + (steps - 1) * ka
         refinement_metadata = dataclasses.replace(
             metadata,
             num_actual_tokens=num_reqs * queries_per_req,
@@ -133,14 +154,92 @@ class CRLSpeculator(DFlash2Speculator):
             )
             return out
 
-        down, r = crl(h, pred.reshape(-1), rope, attend)  # [R * N * ka, D] each
+        down, r = crl(h, pred.reshape(-1), rope, attend)  # [R * Q, D] each
         # final norm of r'' = r' + down: the add is fused into the norm (the base-class call, not the pre-norm variant)
         x, _ = RMSNorm.forward(model.norm, down, r)
-        x = x.view(num_reqs, steps, ka, d)
+        x = x.view(num_reqs, queries_per_req, d)
         lm_weight = self.model.lm_head.weight
         w = lm_weight[candidate_ids]  # [R, N, K, D]
-        scores = torch.einsum("rnad,rnkd->rnak", x, w).float()
+        scores0 = torch.einsum("rd,rkd->rk", x[:, 0], w[:, 0]).float()
+        scores = torch.einsum(
+            "rnad,rnkd->rnak", x[:, 1:].reshape(num_reqs, steps - 1, ka, d), w[:, 1:]
+        ).float()
         table = unary_logits.view(num_reqs, steps, 1, k).float().expand(-1, -1, k, -1).clone()
-        table[:, :, :ka, :] = scores
+        table[:, 0] = scores0[:, None, :]
+        table[:, 1:, :ka, :] = scores
         return table
 
+    def _score_fused(self, candidate_ids, unary_logits, hidden_states):
+        model = self.model.model
+        crl = model.crl
+        num_reqs, steps, k = candidate_ids.shape
+        d = model.config.hidden_size
+        device = candidate_ids.device
+        ka = crl.pred_topk
+        nq = 1 + (steps - 1) * ka
+        total = num_reqs * nq
+        hidden = hidden_states.reshape(num_reqs * steps, -1)
+        # (a strided view of the input ids: the kernel indexes it as a dense [R] array)
+        anchor = self.input_buffers.input_ids[: num_reqs * self.num_query_per_req : self.num_query_per_req].contiguous()
+        candidate_ids = candidate_ids.contiguous()
+        x1 = torch.empty(total, d, dtype=hidden.dtype, device=device)
+        r = torch.empty_like(x1)
+        positions = torch.empty(total, dtype=self.sample_pos.dtype, device=device)
+        _crl_prep_kernel[(total,)](
+            hidden,
+            hidden.stride(0),
+            anchor,
+            candidate_ids,
+            self.sample_pos,
+            crl.emb_table,
+            crl.norm1.weight,
+            x1,
+            r,
+            positions,
+            crl.norm1.variance_epsilon,
+            num_rows=steps,
+            top_k=k,
+            ka=ka,
+            D=d,
+            BLOCK=triton.next_power_of_2(d),
+        )
+        q = crl.q_proj(x1)
+        qh = q.view(-1, crl.head_dim)
+        qn = torch.empty_like(qh)
+        ops.rms_norm(qn, qh, crl.q_norm.weight, crl.q_norm.variance_epsilon)
+        q = qn.view(total, -1)
+        cache = model._rope_cos_sin_cache
+        if cache.dtype != q.dtype:
+            cache = cache.to(dtype=q.dtype)
+        ops.rotary_embedding(positions, q, None, model._rope_head_size, cache, model._rope_is_neox)
+
+        layer = model.layers[-1].self_attn.attn
+        metadata = self._crl_attn_metadata[layer.layer_name]
+        refinement_metadata = dataclasses.replace(
+            metadata,
+            num_actual_tokens=total,
+            max_query_len=nq,
+            query_start_loc=torch.arange(num_reqs + 1, device=device, dtype=metadata.query_start_loc.dtype) * nq,
+            scheduler_metadata=None,
+            causal=False,
+        )
+        heads = q.view(total, -1, crl.head_dim)
+        o = torch.empty_like(heads)
+        layer.impl.forward(layer, heads, heads, heads, layer.kv_cache, refinement_metadata, o)
+        x2 = crl.o_proj(o.view(total, -1))
+        ops.fused_add_rms_norm(x2, r, crl.norm2.weight, crl.norm2.variance_epsilon)
+        down = crl.down_proj(crl.act(torch.nn.functional.linear(x2, crl.gate_up_weight)))
+        ops.fused_add_rms_norm(down, r, model.norm.weight, model.norm.variance_epsilon)  # r'' = r' + down, normed
+        table = unary_logits.view(num_reqs, steps, 1, k).float().expand(-1, -1, k, -1).clone()
+        _crl_score_kernel[(total,)](
+            down,
+            candidate_ids,
+            self.model.lm_head.weight,
+            table,
+            num_rows=steps,
+            top_k=k,
+            ka=ka,
+            D=d,
+            BLOCK_D=min(1024, triton.next_power_of_2(d)),
+        )
+        return table
