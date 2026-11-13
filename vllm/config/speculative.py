@@ -647,7 +647,7 @@ class SpeculativeConfig:
     on the walked path, one tau per request class (``crl_confidence_tau`` for
     greedy requests, ``crl_confidence_tau_sampled`` for temperature > 0).
     'null': (1 - sigmoid(delta)) * max softmax(S), the Null Candidate probe
-    (``null_probe.safetensors`` in the draft directory); tau is 1. Every choice
+    (``null_probe.npz`` in the draft directory); tau is 1. Every choice
     reads only the score row of the drafted predecessor, so rejection sampling
     stays lossless."""
 

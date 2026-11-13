@@ -18,7 +18,6 @@ import dataclasses
 import os
 
 import torch
-from safetensors.torch import load_file
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -50,7 +49,7 @@ class CRLSpeculator(DFlash2Speculator):
         self._fused = os.environ.get("VLLM_CRL_FUSED", "1") == "1"
         # Dynamic verification: where the per-row confidence comes from. "estimator" = upstream's online logistic on logit(max q) (the default
         # path of DFlash 2); "temperature" = max softmax(S / tau) with one tau per request class; "null" = (1 - sigmoid(delta)) * max softmax(S)
-        # with the Null Candidate probe (``null_probe.safetensors`` next to the draft weights). Only the last two are computed here.
+        # with the Null Candidate probe (``null_probe.npz`` next to the draft weights). Only the last two are computed here.
         spec = vllm_config.speculative_config
         self._conf_mode = spec.crl_confidence
         self._tau_greedy = float(spec.crl_confidence_tau)
@@ -95,12 +94,15 @@ class CRLSpeculator(DFlash2Speculator):
     def _load_null_probe(self) -> None:
         if not self._fused:
             raise ValueError("crl_confidence='null' needs the fused refinement stage (VLLM_CRL_FUSED=1)")
-        path = os.path.join(self.draft_model_config.model, "null_probe.safetensors")
+        # (an .npz, not a .safetensors: the weight loader of the draft model reads every *.safetensors of the directory as model weights)
+        path = os.path.join(self.draft_model_config.model, "null_probe.npz")
         if not os.path.exists(path):
-            raise ValueError(f"crl_confidence='null' needs the Null Candidate probe {path} (AngelSpec: tools/train_null_probe.py)")
-        tensors = load_file(path)
+            raise ValueError(f"crl_confidence='null' needs the Null Candidate probe {path} (AngelSpec: tools/sim_trajectory.py --null-probe-train)")
+        import numpy as np
+
+        with np.load(path) as f:
+            w, beta = torch.from_numpy(f["w"]).float(), torch.from_numpy(f["beta"]).float()
         d = self.draft_model_config.hf_config.hidden_size
-        w, beta = tensors["w"].float(), tensors["beta"].float()
         if w.shape != (d,) or beta.shape != (self.num_speculative_steps,):
             raise ValueError(f"{path}: w {tuple(w.shape)} / beta {tuple(beta.shape)} do not match hidden {d} / {self.num_speculative_steps} rows")
         self._null_w = w.to(self.device)
