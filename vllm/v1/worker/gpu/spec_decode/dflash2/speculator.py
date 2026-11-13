@@ -265,11 +265,18 @@ class DFlash2Speculator(DFlashSpeculator):
             self.draft_logits_shard_idx,
         )
         if self.enable_adaptive_verification:
-            self._maybe_predict_acceptance(
-                self.candidate_sampler.scores[:num_reqs].flatten(0, 1),
-                self.sample_idx_mapping[:num_sample],
-                self.sample_col[:num_sample],
-            )
+            self._predict_confidence(candidate_ids, num_reqs, num_sample)
+
+    def _predict_confidence(
+        self, candidate_ids: torch.Tensor, num_reqs: int, num_sample: int
+    ) -> None:
+        """Write this step's per-row confidences (``draft_token_confidence_probs``), from the walk's realized score rows. Default: the online
+        acceptance estimator (upstream's logistic on logit(max q))."""
+        self._maybe_predict_acceptance(
+            self.candidate_sampler.scores[:num_reqs].flatten(0, 1),
+            self.sample_idx_mapping[:num_sample],
+            self.sample_col[:num_sample],
+        )
 
     def _score_candidates(
         self,

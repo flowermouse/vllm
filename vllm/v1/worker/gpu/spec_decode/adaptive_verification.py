@@ -286,8 +286,27 @@ class AdaptiveVerificationManager:
         self._copy_events = [torch.cuda.Event(blocking=True) for _ in range(2)]
         self._pending_resets: list[int] = []
         self._stale_idx = 0
+        # Budget statistics (host counters, read through Worker.adaptive_verification_stats)
+        self._stats = self._new_stats()
         for slot in self._stale_confidences:
             slot.np.fill(1.0)
+
+    @staticmethod
+    def _new_stats() -> dict[str, int]:
+        return {
+            "steps": 0,  # engine steps with drafts
+            "bound_steps": 0,  # steps whose budget trimmed the scheduled drafts
+            "requests": 0,  # verification requests (those with scheduled drafts)
+            "scheduled_drafts": 0,
+            "admitted_drafts": 0,
+        }
+
+    def pop_stats(self, reset: bool = True) -> dict[str, int]:
+        """Budget statistics since the last reset: verified drafts per request-round = admitted_drafts / requests."""
+        stats = dict(self._stats)
+        if reset:
+            self._stats = self._new_stats()
+        return stats
 
     def warmup_budget_kernel(self) -> None:
         """JIT the draft-budget kernel so the first binding step doesn't compile."""
@@ -459,6 +478,12 @@ class AdaptiveVerificationManager:
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
         draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        num_scheduled_drafts = int(scheduled_drafts.sum())
+        self._stats["steps"] += 1
+        self._stats["bound_steps"] += int(draft_budget < num_scheduled_drafts)
+        self._stats["requests"] += int(np.count_nonzero(scheduled_drafts))
+        self._stats["scheduled_drafts"] += num_scheduled_drafts
+        self._stats["admitted_drafts"] += draft_budget
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,

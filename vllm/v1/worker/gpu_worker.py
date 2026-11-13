@@ -644,6 +644,12 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    def adaptive_verification_stats(self, reset: bool = True) -> dict[str, int] | None:
+        """Draft-budget statistics of adaptive verification since the last reset
+        (None when it is off). ``LLM.collective_rpc("adaptive_verification_stats")``."""
+        manager = getattr(self.model_runner, "adaptive_verification", None)
+        return None if manager is None else manager.pop_stats(reset)
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much

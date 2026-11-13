@@ -584,7 +584,8 @@ class SpeculativeConfig:
 
     enable_adaptive_verification: bool = False
     """Whether to adaptively size the draft-verification budget from per-request
-    confidence. Currently only supported for method="dspark"."""
+    confidence. Supported for method="dspark" (confidence head) and for the
+    AngelSpec CRL / RAL drafts under method="dflash" (see ``crl_confidence``)."""
 
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -638,6 +639,24 @@ class SpeculativeConfig:
     real predecessor), so it overrides the exported draft config's
     ``crl_pred_topk`` (the default) when set. 1 <= K_a <= ``selector_top_k``."""
 
+    crl_confidence: Literal["estimator", "temperature", "null"] = "estimator"
+    """CRL / RAL drafts with ``enable_adaptive_verification``: where the per-row
+    confidence comes from. 'estimator': upstream's online logistic on
+    logit(max q) (shared slope, one intercept per row, fitted from verified
+    rounds). 'temperature': max softmax(S / tau) of the refinement layer's scores
+    on the walked path, one tau per request class (``crl_confidence_tau`` for
+    greedy requests, ``crl_confidence_tau_sampled`` for temperature > 0).
+    'null': (1 - sigmoid(delta)) * max softmax(S), the Null Candidate probe
+    (``null_probe.safetensors`` in the draft directory); tau is 1. Every choice
+    reads only the score row of the drafted predecessor, so rejection sampling
+    stays lossless."""
+
+    crl_confidence_tau: float = Field(default=1.0, gt=0.0)
+    """Temperature of the 'temperature' confidence for greedy requests."""
+
+    crl_confidence_tau_sampled: float | None = Field(default=None, gt=0.0)
+    """Same for requests with temperature > 0 (default: ``crl_confidence_tau``)."""
+
     draft_sample_method: DraftSampleMethod = "greedy"
     """How the draft model samples tokens. 'greedy' always picks the argmax
     token, and the draft probabilities are treated as one-hot during rejection
@@ -689,6 +708,9 @@ class SpeculativeConfig:
         factors.append(uses_aux_hidden_states)
         if self.method == "dspark":
             factors.append(self.enable_adaptive_verification)
+        elif self.enable_adaptive_verification:
+            # (a fixed-length dflash / CRL draft keeps its old hash)
+            factors.append(("adaptive_verification", self.crl_confidence))
 
         if self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
@@ -1417,6 +1439,18 @@ class SpeculativeConfig:
 
                 if self.crl_pred_topk is not None:
                     self._override_crl_pred_topk(self.draft_model_config.hf_config)
+                if self.crl_confidence != "estimator" and not (
+                    isinstance(
+                        getattr(
+                            self.draft_model_config.hf_config, "dflash_config", None
+                        ),
+                        dict,
+                    )
+                    and "crl_pred_topk" in self.draft_model_config.hf_config.dflash_config
+                ):
+                    raise ValueError(
+                        f"crl_confidence={self.crl_confidence!r} needs a CRL / RAL draft."
+                    )
 
                 # Automatically detect the method
                 if self.method in (

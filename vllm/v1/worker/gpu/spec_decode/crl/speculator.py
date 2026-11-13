@@ -17,12 +17,19 @@ import dataclasses
 import os
 
 import torch
+from safetensors.torch import load_file
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.triton_utils import triton
-from vllm.v1.worker.gpu.spec_decode.crl.fused import _crl_prep_kernel, _crl_score_kernel
+from vllm.v1.worker.gpu.spec_decode.crl.fused import (
+    MODE_NULL,
+    MODE_TEMPERATURE,
+    _crl_confidence_kernel,
+    _crl_prep_kernel,
+    _crl_score_kernel,
+)
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
 logger = init_logger(__name__)
@@ -39,6 +46,16 @@ class CRLSpeculator(DFlash2Speculator):
         # the stage's glue as two Triton kernels + the CUDA norm ops (crl/fused.py); VLLM_CRL_FUSED=0 runs the PyTorch reference path (same numbers
         # up to bf16 rounding of the candidate scores)
         self._fused = os.environ.get("VLLM_CRL_FUSED", "1") == "1"
+        # Dynamic verification: where the per-row confidence comes from. "estimator" = upstream's online logistic on logit(max q) (the default
+        # path of DFlash 2); "temperature" = max softmax(S / tau) with one tau per request class; "null" = (1 - sigmoid(delta)) * max softmax(S)
+        # with the Null Candidate probe (``null_probe.safetensors`` next to the draft weights). Only the last two are computed here.
+        spec = vllm_config.speculative_config
+        self._conf_mode = spec.crl_confidence
+        self._tau_greedy = float(spec.crl_confidence_tau)
+        self._tau_sampled = float(spec.crl_confidence_tau_sampled or spec.crl_confidence_tau)
+        self._null_w: torch.Tensor | None = None
+        self._null_beta: torch.Tensor | None = None
+        self._null_delta: torch.Tensor | None = None
         logger.info(
             "%s: %d rows, top-%d candidates, %d predecessors per row; at temperature > 0 the drafts are %s",
             self._speculator_name,
@@ -54,7 +71,56 @@ class CRLSpeculator(DFlash2Speculator):
         model = super().load_draft_model(target_model, target_attn_layer_names)
         # the target's (frozen) input embedding is shared with the draft by now: tabulate W_e RMSNorm_e(E_in) once
         model.model.crl.build_inference_buffers(model.model.embed_tokens.weight)
+        if self.enable_adaptive_verification and self._conf_mode != "estimator":
+            # the confidence is computed in the draft graph (below), not by the online estimator
+            self.use_acceptance_estimator = False
+            if self._conf_mode == "null":
+                self._load_null_probe()
         return model
+
+    def _load_null_probe(self) -> None:
+        if not self._fused:
+            raise ValueError("crl_confidence='null' needs the fused refinement stage (VLLM_CRL_FUSED=1)")
+        path = os.path.join(self.draft_model_config.model, "null_probe.safetensors")
+        if not os.path.exists(path):
+            raise ValueError(f"crl_confidence='null' needs the Null Candidate probe {path} (AngelSpec: tools/train_null_probe.py)")
+        tensors = load_file(path)
+        d = self.draft_model_config.hf_config.hidden_size
+        w, beta = tensors["w"].float(), tensors["beta"].float()
+        if w.shape != (d,) or beta.shape != (self.num_speculative_steps,):
+            raise ValueError(f"{path}: w {tuple(w.shape)} / beta {tuple(beta.shape)} do not match hidden {d} / {self.num_speculative_steps} rows")
+        self._null_w = w.to(self.device)
+        self._null_beta = beta.to(self.device)
+        ka = int(self.draft_model_config.hf_config.dflash_config["crl_pred_topk"])
+        self._null_delta = torch.zeros(self.max_num_reqs, self.num_speculative_steps, ka, dtype=torch.float32, device=self.device)
+        logger.info("%s: Null Candidate probe loaded from %s", self._speculator_name, path)
+
+    def _predict_confidence(self, candidate_ids, num_reqs, num_sample) -> None:
+        if self._conf_mode == "estimator":
+            super()._predict_confidence(candidate_ids, num_reqs, num_sample)
+            return
+        if self._skip_stage or self._crl_attn_metadata is None:
+            return  # a dummy run without attention metadata: no scores to read
+        steps = self.num_speculative_steps
+        null = self._conf_mode == "null"
+        _crl_confidence_kernel[(num_reqs * steps,)](
+            self.candidate_sampler.scores,
+            candidate_ids.contiguous(),
+            self.draft_tokens,
+            self._null_delta if null else self.candidate_sampler.scores,
+            self._null_beta if null else self.candidate_sampler.scores,
+            self.sample_idx_mapping,
+            self.temperature,
+            self.draft_token_confidence_probs,
+            self.draft_token_confidence_probs.stride(0),
+            self._tau_greedy,
+            self._tau_sampled,
+            num_rows=steps,
+            top_k=self.top_k,
+            ka=int(self.draft_model_config.hf_config.dflash_config["crl_pred_topk"]),
+            MODE=MODE_NULL if null else MODE_TEMPERATURE,
+            num_warps=1,
+        )
 
     def _generate_draft(
         self,
@@ -231,15 +297,19 @@ class CRLSpeculator(DFlash2Speculator):
         down = crl.down_proj(crl.act(torch.nn.functional.linear(x2, crl.gate_up_weight)))
         ops.fused_add_rms_norm(down, r, model.norm.weight, model.norm.variance_epsilon)  # r'' = r' + down, normed
         table = unary_logits.view(num_reqs, steps, 1, k).float().expand(-1, -1, k, -1).clone()
+        null = self._conf_mode == "null" and self.enable_adaptive_verification
         _crl_score_kernel[(total,)](
             down,
             candidate_ids,
             self.model.lm_head.weight,
             table,
+            self._null_w if null else table,
+            self._null_delta if null else table,
             num_rows=steps,
             top_k=k,
             ka=ka,
             D=d,
             BLOCK_D=min(1024, triton.next_power_of_2(d)),
+            NULL=null,
         )
         return table

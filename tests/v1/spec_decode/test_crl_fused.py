@@ -4,7 +4,9 @@
 
 ``_crl_prep_kernel`` builds, for every refinement query (row 1 once with the anchor token as predecessor, every later row once per
 predecessor ``j < crl_pred_topk`` of the row before): ``r = bf16(h + E[pred])``, ``x1 = RMSNorm_1(r)`` and the rope position.
-``_crl_score_kernel`` writes the 16 candidate logits ``x . W[cand]`` of every query into the score table (row 1: into all K predecessor slots).
+``_crl_score_kernel`` writes the 16 candidate logits ``x . W[cand]`` of every query into the score table (row 1: into all K predecessor slots)
+and, with the Null Candidate probe, ``x . w_null`` of every query into the delta table.
+(``_crl_confidence_kernel`` is tested in ``test_crl_confidence.py``, which also runs on CPU.)
 Run on its own: ``python -m pytest tests/v1/spec_decode/test_crl_fused.py`` (needs CUDA).
 """
 
@@ -65,14 +67,22 @@ def test_prep_and_score_match_the_pytorch_definition(d):
     # scores: x is any [total, d] activation here
     x = torch.randn(total, d, generator=g, device=DEVICE).bfloat16()
     table = torch.full((R, N, K, K), -123.0, device=DEVICE)
-    _crl_score_kernel[(total,)](x, cand, lm, table, num_rows=N, top_k=K, ka=KA, D=d, BLOCK_D=min(1024, triton.next_power_of_2(d)))
+    null_w = torch.randn(d, generator=g, device=DEVICE)
+    delta = torch.full((R, N, KA), -7.0, device=DEVICE)
+    _crl_score_kernel[(total,)](
+        x, cand, lm, table, null_w, delta, num_rows=N, top_k=K, ka=KA, D=d, BLOCK_D=min(1024, triton.next_power_of_2(d)), NULL=True
+    )
     expected = torch.full_like(table, -123.0)
+    expected_delta = torch.full_like(delta, -7.0)
     for req in range(R):
         for q in range(nq):
             k, j = rows[q], preds_j[q]
             s = (lm[cand[req, k]].float() @ x[req * nq + q].float())  # [K]
+            expected_delta[req, k, j] = null_w @ x[req * nq + q].float()
             if q == 0:
                 expected[req, 0, :, :] = s  # row 1: every predecessor slot carries the same scores
             else:
                 expected[req, k, j, :] = s
     torch.testing.assert_close(table, expected, atol=2e-2, rtol=2e-3)
+    torch.testing.assert_close(delta, expected_delta, atol=5e-2, rtol=2e-3)
+
