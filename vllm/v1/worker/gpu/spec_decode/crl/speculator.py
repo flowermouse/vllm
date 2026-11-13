@@ -13,6 +13,7 @@ was ~450 of its ~700 us per engine step; ``crl/fused.py`` replaces it by two Tri
 norm ops, ~40% off the stage.
 """
 
+import atexit
 import dataclasses
 import os
 
@@ -26,6 +27,7 @@ from vllm.triton_utils import triton
 from vllm.v1.worker.gpu.spec_decode.crl.fused import (
     MODE_NULL,
     MODE_TEMPERATURE,
+    _calib_store_kernel,
     _crl_confidence_kernel,
     _crl_prep_kernel,
     _crl_score_kernel,
@@ -56,6 +58,13 @@ class CRLSpeculator(DFlash2Speculator):
         self._null_w: torch.Tensor | None = None
         self._null_beta: torch.Tensor | None = None
         self._null_delta: torch.Tensor | None = None
+        # Calibration dump (a measurement tool, host syncs on every step: never in a timed run): for every verified round the walked score rows
+        # [N, K], the request's temperature and the verdict (accepted / admitted drafts), so that the one temperature of the 'temperature'
+        # confidence can be fitted offline on the real sampling path (Dynamic-Verification-Eval, "T=1"). VLLM_CRL_CALIB_DUMP=<file.npz>
+        self._calib_path = os.environ.get("VLLM_CRL_CALIB_DUMP") or None
+        self._calib_rows: list = []
+        self._calib_scores: torch.Tensor | None = None
+        self._calib_valid: torch.Tensor | None = None
         logger.info(
             "%s: %d rows, top-%d candidates, %d predecessors per row; at temperature > 0 the drafts are %s",
             self._speculator_name,
@@ -71,6 +80,11 @@ class CRLSpeculator(DFlash2Speculator):
         model = super().load_draft_model(target_model, target_attn_layer_names)
         # the target's (frozen) input embedding is shared with the draft by now: tabulate W_e RMSNorm_e(E_in) once
         model.model.crl.build_inference_buffers(model.model.embed_tokens.weight)
+        if self._calib_path is not None:
+            self._calib_scores = torch.zeros(self.max_num_reqs, self.num_speculative_steps, self.top_k, dtype=torch.float32, device=self.device)
+            self._calib_valid = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=self.device)
+            atexit.register(self._calib_save)
+            logger.info("%s: calibration dump -> %s", self._speculator_name, self._calib_path)
         if self.enable_adaptive_verification and self._conf_mode != "estimator":
             # the confidence is computed in the draft graph (below), not by the online estimator
             self.use_acceptance_estimator = False
@@ -94,6 +108,44 @@ class CRLSpeculator(DFlash2Speculator):
         ka = int(self.draft_model_config.hf_config.dflash_config["crl_pred_topk"])
         self._null_delta = torch.zeros(self.max_num_reqs, self.num_speculative_steps, ka, dtype=torch.float32, device=self.device)
         logger.info("%s: Null Candidate probe loaded from %s", self._speculator_name, path)
+
+    def _calib_save(self) -> None:
+        if not self._calib_rows:
+            return
+        import numpy as np
+
+        cols = list(zip(*self._calib_rows))
+        np.savez(
+            self._calib_path,
+            scores=np.concatenate(cols[0]),
+            temperature=np.concatenate(cols[1]),
+            accepted=np.concatenate(cols[2]),
+            admitted=np.concatenate(cols[3]),
+        )
+
+    def observe_verification(self, idx_mapping, num_sampled, num_rejected) -> None:
+        super().observe_verification(idx_mapping, num_sampled, num_rejected)
+        if self._calib_path is None or self._calib_scores is None:
+            return
+        from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+
+        with gpu_sync_allowed():
+            ok = self._calib_valid[idx_mapping] > 0
+            self._calib_valid[idx_mapping] = 0
+            keep = ok.cpu().numpy()
+            if keep.any():
+                accepted = (num_sampled.long() - 1).clamp(min=0)
+                admitted = accepted + num_rejected.long()
+                self._calib_rows.append(
+                    (
+                        self._calib_scores[idx_mapping].cpu().numpy()[keep],
+                        self.temperature[idx_mapping].cpu().numpy()[keep],
+                        accepted.cpu().numpy()[keep],
+                        admitted.cpu().numpy()[keep],
+                    )
+                )
+                if len(self._calib_rows) % 400 == 0:
+                    self._calib_save()
 
     def _predict_confidence(self, candidate_ids, num_reqs, num_sample) -> None:
         if self._conf_mode == "estimator":
@@ -144,6 +196,17 @@ class CRLSpeculator(DFlash2Speculator):
             num_tokens_across_dp,
             **kwargs,
         )
+        if self._calib_scores is not None and self._crl_attn_metadata is not None:
+            steps = self.num_speculative_steps
+            _calib_store_kernel[(num_reqs * steps,)](
+                self.candidate_sampler.scores,
+                self.sample_idx_mapping,
+                self._calib_scores,
+                self._calib_valid,
+                num_rows=steps,
+                top_k=self.top_k,
+                num_warps=1,
+            )
 
     def _score_candidates(
         self,

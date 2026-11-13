@@ -166,3 +166,21 @@ def _crl_confidence_kernel(
         recall = 1.0 - 1.0 / (1.0 + tl.exp(-delta))
         conf = tl.where(has_query, conf * recall, conf)
     tl.store(conf_ptr + req * conf_stride + k, conf)
+
+
+@triton.jit
+def _calib_store_kernel(
+    scores_ptr,  # [R, N, K] fp32: the walk's realized score rows (batch position)
+    req_state_ptr,  # [R * N] int: request-state index of every sample row, -1 for graph padding
+    out_ptr,  # [max_num_reqs, N, K] fp32: the rows of the latest proposal of every request state
+    valid_ptr,  # [max_num_reqs] int32: 1 = the state's rows are those of a proposal that has not been verified yet
+    num_rows: tl.constexpr,
+    top_k: tl.constexpr,
+):
+    p = tl.program_id(0)
+    state = tl.load(req_state_ptr + p)
+    if state < 0:
+        return
+    b = tl.arange(0, top_k)
+    tl.store(out_ptr + state.to(tl.int64) * (num_rows * top_k) + (p % num_rows) * top_k + b, tl.load(scores_ptr + p * top_k + b))
+    tl.store(valid_ptr + state, 1)
