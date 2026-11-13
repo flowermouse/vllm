@@ -388,6 +388,19 @@ class AdaptiveVerificationManager:
             self._cudagraph_limit,
         )
         logger.debug("DSpark cost tables: %s", self.cost_tables)
+        draft_table, verify_table = self.cost_tables
+        picks = [n for n in (1, 2, 4, 8, 16, 32, 64, 96) if n < len(draft_table)]
+        logger.info(
+            "Adaptive verification cost curves (ms): drafter at %s requests: %s",
+            picks,
+            [round(float(draft_table[n]), 3) for n in picks],
+        )
+        picks = [n for n in (8, 32, 128, 256, 512, 1024, 2048, 4096) if n < len(verify_table)]
+        logger.info(
+            "Adaptive verification cost curves (ms): verify at %s tokens: %s",
+            picks,
+            [round(float(verify_table[n]), 3) for n in picks],
+        )
 
     def record_confidences(
         self, confidence_probs: torch.Tensor, input_batch: "InputBatch"
