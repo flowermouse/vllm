@@ -67,8 +67,10 @@ def _assign_draft_token_budget_kernel(
     capacities_ptr,
     # [max_num_reqs * num_steps]
     survival_ptr,
+    gpu_d_ptr,
     num_reqs,
     draft_budget,
+    HAS_GPU_D: tl.constexpr,
     NUM_STEPS: tl.constexpr,
     BLOCK_REQS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -80,15 +82,28 @@ def _assign_draft_token_budget_kernel(
         mask = reqs < num_reqs
         req_state_idx = tl.load(idx_mapping_ptr + reqs, mask=mask, other=0)
         capacity = tl.load(capacities_ptr + reqs, mask=mask, other=0)
+        gpu_d = (
+            tl.load(gpu_d_ptr + req_state_idx, mask=mask, other=NUM_STEPS)
+            if HAS_GPU_D
+            else tl.full([BLOCK_REQS], NUM_STEPS, tl.int32)
+        )
         survival = tl.full([BLOCK_REQS], 1.0, tl.float32)
         for step in tl.static_range(NUM_STEPS):
+            # Only drafted slots (step < capacity) enter the product. A stale 0
+            # or NaN past the previous depth must not be bitcast: that is what
+            # aborts the binary search, and it would also pin this step's cut
+            # at the previous depth.
+            eligible = mask & (step < capacity)
             prob = tl.load(
                 confidence_probs_ptr + req_state_idx * confidence_probs_stride + step,
-                mask=mask,
-                other=0.0,
+                mask=eligible,
+                other=1.0,
             )
-            survival *= prob
-            bits = tl.where(step < capacity, survival.to(tl.int32, bitcast=True), -1)
+            prob = tl.where(prob == prob, prob, 1.0)
+            if HAS_GPU_D:
+                prob = tl.where(step < gpu_d, prob, 0.0)
+            survival = tl.where(eligible, survival * prob, survival)
+            bits = tl.where(eligible, survival.to(tl.int32, bitcast=True), -1)
             tl.store(survival_ptr + reqs * NUM_STEPS + step, bits, mask=mask)
     tl.debug_barrier()
 
@@ -131,6 +146,7 @@ def assign_draft_token_budget(
     capacities: torch.Tensor,
     draft_budget: int,
     survival: torch.Tensor,
+    gpu_d: torch.Tensor | None = None,
 ) -> None:
     """Admit the globally best `draft_budget` draft slots, in place.
 
@@ -151,8 +167,10 @@ def assign_draft_token_budget(
         idx_mapping,
         capacities,
         survival,
+        capacities if gpu_d is None else gpu_d,
         idx_mapping.shape[0],
         draft_budget,
+        HAS_GPU_D=gpu_d is not None,
         NUM_STEPS=num_steps,
         BLOCK_REQS=256,
         BLOCK_SIZE=1024,
@@ -248,6 +266,7 @@ class AdaptiveVerificationManager:
         # Largest cudagraph-captured token count; above it nothing pads.
         self._cudagraph_limit = 0
         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
+        self._gpu_draft_depths: torch.Tensor | None = None
         max_num_reqs = req_states.max_num_reqs
         # Current per-slot confidences
         self._confidence_probs = torch.empty(
@@ -380,6 +399,8 @@ class AdaptiveVerificationManager:
                 "`enable_adaptive_verification=false` in the speculative config to "
                 "verify a fixed number of drafts instead."
             )
+        from vllm.v1.worker.gpu.spec_decode.crl.elastic_plan import publish_verify_cost
+
         self.cost_tables = build_cost_tables_from_curves(
             draft_curve,
             verify_curve,
@@ -387,6 +408,7 @@ class AdaptiveVerificationManager:
             self.req_states.max_num_batched_tokens,
             self._cudagraph_limit,
         )
+        publish_verify_cost(self.cost_tables[1])
         logger.debug("DSpark cost tables: %s", self.cost_tables)
         draft_table, verify_table = self.cost_tables
         picks = [n for n in (1, 2, 4, 8, 16, 32, 64, 96) if n < len(draft_table)]
@@ -395,7 +417,9 @@ class AdaptiveVerificationManager:
             picks,
             [round(float(draft_table[n]), 3) for n in picks],
         )
-        picks = [n for n in (8, 32, 128, 256, 512, 1024, 2048, 4096) if n < len(verify_table)]
+        picks = [
+            n for n in (8, 32, 128, 256, 512, 1024, 2048, 4096) if n < len(verify_table)
+        ]
         logger.info(
             "Adaptive verification cost curves (ms): verify at %s tokens: %s",
             picks,
@@ -455,6 +479,13 @@ class AdaptiveVerificationManager:
             dtype=np.int32,
             count=num_reqs,
         )
+        from vllm.v1.worker.gpu.spec_decode.crl.elastic_plan import (
+            cap_scheduled,
+            last_draft_ms,
+            verify_cut,
+        )
+
+        scheduled_drafts, verify_mode = cap_scheduled(slots, scheduled_drafts)
         stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
         steps = np.arange(self.num_speculative_steps)
@@ -490,7 +521,30 @@ class AdaptiveVerificationManager:
             req_id: int(num_tokens)
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
-        draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        if verify_mode == "off":
+            draft_budget = int(scheduled_drafts.sum())
+        elif verify_mode == "lambda":
+            d_ms = last_draft_ms()
+            if d_ms is not None and d_ms > 0:
+                e_costs = (
+                    d_ms
+                    + verify_cost_ms[
+                        num_non_draft_tokens_total : num_non_draft_tokens_total
+                        + max_draft_budget
+                        + 1
+                    ]
+                )
+                draft_budget = int(
+                    np.argmax(num_tokens_to_estimated_accepted_tokens / e_costs)
+                )
+            else:
+                draft_budget = verify_cut(
+                    scores, num_non_draft_tokens_total, verify_cost_ms
+                )
+        else:
+            draft_budget = int(
+                np.argmax(num_tokens_to_estimated_accepted_tokens / costs)
+            )
         num_scheduled_drafts = int(scheduled_drafts.sum())
         self._stats["steps"] += 1
         self._stats["bound_steps"] += int(draft_budget < num_scheduled_drafts)
@@ -581,6 +635,7 @@ class AdaptiveVerificationManager:
                     capacities,
                     draft_budget,
                     self._draft_survival,
+                    gpu_d=self._gpu_draft_depths,
                 )
 
         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]

@@ -23,32 +23,37 @@ def _selector_walk_kernel(
     seeds_ptr,
     tokens_ptr,
     realized_scores_ptr,
+    row_limits_ptr,
+    pad_token,
     num_steps: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SAMPLE_PROBABILISTIC: tl.constexpr,
     USE_FP64: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_K)
     mask = offsets < top_k
     req_state = tl.load(req_state_ptr + row * num_steps)
     valid = req_state >= 0
+    limit = tl.load(row_limits_ptr + row) if HAS_LIMIT else num_steps
     temperature = tl.load(temperature_ptr + req_state, mask=valid, other=0.0)
     seed = tl.load(seeds_ptr + req_state, mask=valid, other=0)
     previous = 0
     for step in range(num_steps):
         flat = row * num_steps + step
+        live = valid & (step < limit)
         score_base = (flat * top_k + previous) * top_k
         scores = tl.load(
             scores_ptr + score_base + offsets,
-            mask=mask & valid,
+            mask=mask & live,
             other=float("-inf"),
         ).to(tl.float64 if USE_FP64 else tl.float32)
         candidate_base = flat * top_k
         candidates = tl.load(
             candidate_ptr + candidate_base + offsets,
-            mask=mask & valid,
+            mask=mask & live,
             other=0,
         )
 
@@ -58,7 +63,7 @@ def _selector_walk_kernel(
         _, index = gumbel_noised_argmax(
             scores,
             candidates,
-            mask & valid,
+            mask & live,
             spec_step_seed(seed, step),
             sample_pos,
             temperature if SAMPLE_PROBABILISTIC else 0.0,
@@ -69,11 +74,15 @@ def _selector_walk_kernel(
         tl.store(
             realized_scores_ptr + candidate_base + offsets,
             scores,
-            mask=mask & valid,
+            mask=mask & live,
         )
-        token = tl.load(candidate_ptr + candidate_base + index, mask=valid, other=0)
+        drawn = tl.load(candidate_ptr + candidate_base + index, mask=live, other=0)
+        # Rows past this request's draft length are a real vocab id (the mask), not -1:
+        # the next step embeds whatever was scheduled. They carry no proposal, so a
+        # fixed-horizon verify rejects them; the prefix was sampled from this forward.
+        token = tl.where(live, drawn, pad_token)
         tl.store(tokens_ptr + flat, token, mask=valid)
-        previous = index
+        previous = tl.where(live, index, previous)
 
 
 @triton.jit
@@ -85,35 +94,45 @@ def _cache_draft_logits_kernel(
     req_state_ptr,
     draft_logits_stride_0,
     draft_logits_stride_1,
+    row_limits_ptr,
+    pad_token,
     num_steps: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_K: tl.constexpr,
     CACHE_NUM_SHARDS: tl.constexpr,
     CACHE_SHARD_IDX: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
 ):
     flat = tl.program_id(0)
     req_state = tl.load(req_state_ptr + flat)
     step = flat % num_steps
+    drafted = step >= 0
+    if HAS_LIMIT:
+        req = flat // num_steps
+        drafted = step < tl.load(row_limits_ptr + req)
     offsets = tl.arange(0, BLOCK_K)
-    mask = (
+    base_mask = (
         (req_state >= 0)
         & (offsets < top_k)
         # A batch-sharded cache holds only this rank's requests, packed by row.
         & (shard_owner(req_state, CACHE_NUM_SHARDS) == CACHE_SHARD_IDX)
     )
+    mask = base_mask & drafted
     candidate_base = flat * top_k
     cache_base = (req_state * num_steps + step) * top_k
-    old_token_ids = tl.load(cached_candidate_ptr + cache_base + offsets, mask=mask)
+    old_token_ids = tl.load(cached_candidate_ptr + cache_base + offsets, mask=base_mask)
     logits_base = (
         draft_logits_ptr
         + shard_row(req_state, CACHE_NUM_SHARDS) * draft_logits_stride_0
         + step * draft_logits_stride_1
     )
-    tl.store(logits_base + old_token_ids, -float("inf"), mask=mask)
-    token_ids = tl.load(candidate_ptr + candidate_base + offsets, mask=mask)
-    scores = tl.load(scores_ptr + candidate_base + offsets, mask=mask)
-    tl.store(logits_base + token_ids, scores, mask=mask)
-    tl.store(cached_candidate_ptr + cache_base + offsets, token_ids, mask=mask)
+    tl.store(logits_base + old_token_ids, -float("inf"), mask=base_mask)
+    token_ids = tl.load(
+        candidate_ptr + candidate_base + offsets, mask=mask, other=pad_token
+    )
+    scores = tl.load(scores_ptr + candidate_base + offsets, mask=mask, other=0.0)
+    tl.store(logits_base + token_ids, scores, mask=base_mask)
+    tl.store(cached_candidate_ptr + cache_base + offsets, token_ids, mask=base_mask)
 
 
 class CandidateSampler:
@@ -145,11 +164,14 @@ class CandidateSampler:
         use_fp64: bool,
         draft_logits_num_shards: int = 1,
         draft_logits_shard_idx: int = 0,
+        row_limits: torch.Tensor | None = None,
+        pad_token: int = 0,
     ) -> None:
         candidate_ids = candidate_ids.contiguous()
         sample_pos = sample_pos.contiguous()
         idx_mapping = idx_mapping.contiguous()
         block_k = triton.next_power_of_2(self.top_k)
+        has_limit = row_limits is not None
         _selector_walk_kernel[(num_reqs,)](
             scores.contiguous(),
             candidate_ids.contiguous(),
@@ -159,11 +181,14 @@ class CandidateSampler:
             seeds,
             draft_tokens,
             self.scores,
+            row_limits if has_limit else draft_tokens,
+            pad_token,
             num_steps=self.num_steps,
             top_k=self.top_k,
             BLOCK_K=block_k,
             SAMPLE_PROBABILISTIC=draft_logits is not None,
             USE_FP64=use_fp64,
+            HAS_LIMIT=has_limit,
             num_warps=1,
         )
 
@@ -175,6 +200,8 @@ class CandidateSampler:
                 draft_logits,
                 draft_logits_num_shards,
                 draft_logits_shard_idx,
+                row_limits,
+                pad_token=pad_token,
             )
 
     def _cache_draft_logits(
@@ -185,8 +212,11 @@ class CandidateSampler:
         draft_logits: torch.Tensor,
         draft_logits_num_shards: int,
         draft_logits_shard_idx: int,
+        row_limits: torch.Tensor | None = None,
+        pad_token: int = 0,
     ) -> None:
         block_k = triton.next_power_of_2(self.top_k)
+        has_limit = row_limits is not None
         _cache_draft_logits_kernel[(num_sample,)](
             draft_logits,
             self.cached_candidate_ids,
@@ -195,11 +225,14 @@ class CandidateSampler:
             idx_mapping,
             draft_logits.stride(0),
             draft_logits.stride(1),
+            row_limits if has_limit else draft_logits,
+            pad_token,
             num_steps=self.num_steps,
             top_k=self.top_k,
             BLOCK_K=block_k,
             CACHE_NUM_SHARDS=draft_logits_num_shards,
             CACHE_SHARD_IDX=draft_logits_shard_idx,
+            HAS_LIMIT=has_limit,
             num_warps=1,
         )
 

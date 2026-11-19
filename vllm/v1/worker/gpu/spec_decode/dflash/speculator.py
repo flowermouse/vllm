@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -20,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import cp_local_slot
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -87,6 +90,18 @@ class DFlashSpeculator(DraftModelSpeculator):
                 "is the bonus token."
             )
         self.sample_from_anchor = False
+        # Per-request query widths for Ours elastic drafting. None keeps the fixed block.
+        self._varlen_d: np.ndarray | None = None
+        self._query_cu_gpu: torch.Tensor | None = None
+        self._pos_in_block: torch.Tensor | None = None
+        self._prof_enabled = os.environ.get("VLLM_ELASTIC_PROFILE", "0") == "1"
+        self._prof_skip = int(os.environ.get("VLLM_ELASTIC_PROFILE_SKIP", "3"))
+        self._prof_keep = int(os.environ.get("VLLM_ELASTIC_PROFILE_KEEP", "8"))
+        self._prof_min_reqs = int(os.environ.get("VLLM_ELASTIC_PROFILE_MIN_REQS", "0"))
+        self._prof_samples: list[tuple[int, float]] = []
+        self._prof_hold: tuple[torch.cuda.Event, torch.cuda.Event, int] | None = None
+        self._prof_start: torch.cuda.Event | None = None
+        self._prof_end: torch.cuda.Event | None = None
         # Query tokens that share one logical position (a slot and its scratch tokens);
         # 1 for DFlash and DSpark. Only subclasses with scratch tokens raise it.
         self.group_size = 1
@@ -189,6 +204,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             prepare_forward=self._prepare_graph_forward,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
+        hook = getattr(self, "_capture_elastic_buckets", None)
+        if hook is not None and os.environ.get("VLLM_ELASTIC", "") == "1":
+            hook()
 
     def _prepare_graph_forward(
         self, num_reqs: int, attn_metadata: dict[str, Any] | None
@@ -322,6 +340,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        skip_compiled: bool = False,
     ) -> torch.Tensor:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -333,6 +352,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
             is_padding=self.input_buffers.is_padding[:num_tokens],
+            skip_compiled=skip_compiled,
         ):
             last_hidden_states = self.model(
                 input_ids=self.input_buffers.input_ids[:num_tokens],
@@ -340,6 +360,103 @@ class DFlashSpeculator(DraftModelSpeculator):
                 inputs_embeds=None,
             )
         return last_hidden_states
+
+    def _run_model_elastic(
+        self,
+        num_tokens: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        uniform: bool,
+    ) -> torch.Tensor:
+        """Replay a private graph when this step's query layout was captured.
+
+        Several layouts are kept (a full block and the mixed ones the gate
+        actually emits). A one-request tail stays under the token floor. A
+        layout that failed to capture stays eager; the others still replay.
+        """
+        del uniform
+        key = getattr(self, "_elastic_pending_key", None)
+        cache: dict = getattr(self, "_elastic_graphs", None) or {}
+        entry = cache.get(key) if key is not None else None
+        if entry is not None and entry["tokens"] == num_tokens:
+            self._refresh_elastic_graph(entry["meta"])
+            entry["graph"].replay()
+            return entry["out"]
+        can_capture = (
+            attn_metadata is not None
+            and key is not None
+            and 256 <= num_tokens <= 4096
+            and os.environ.get("VLLM_ELASTIC_GRAPH", "1") == "1"
+            and key not in getattr(self, "_elastic_graph_failed_keys", ())
+            and len(cache) < 8
+        )
+        if not can_capture:
+            return self._run_model(
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
+        warmed = self._run_model(
+            num_tokens,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+        torch.cuda.synchronize()
+        try:
+            captured = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(captured):
+                graphed = self._run_model(
+                    num_tokens,
+                    attn_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp,
+                    cudagraph_runtime_mode,
+                )
+        except Exception as exc:
+            failed = getattr(self, "_elastic_graph_failed_keys", None)
+            if failed is None:
+                failed = set()
+                self._elastic_graph_failed_keys = failed
+            failed.add(key)
+            logger.info("ELASTIC_GRAPH capture failed (%s); staying eager", exc)
+            return warmed
+        if not cache:
+            cache = {}
+            self._elastic_graphs = cache
+        cache[key] = {
+            "graph": captured,
+            "meta": attn_metadata,
+            "tokens": num_tokens,
+            "out": graphed,
+        }
+        logger.info("ELASTIC_GRAPH captured tokens=%d n=%d", num_tokens, len(cache))
+        return warmed
+
+    def _refresh_elastic_graph(self, attn_metadata: dict[str, Any]) -> None:
+        """Rewrite scheduler metadata in the buffers the captured attention still reads."""
+        for groups in self.attn_groups:
+            for group in groups:
+                name = group.layer_names[0]
+                meta = attn_metadata.get(name)
+                if meta is None:
+                    continue
+                old = getattr(meta, "scheduler_metadata", None)
+                group.update_draft_decode_metadata(attn_metadata)
+                new = getattr(meta, "scheduler_metadata", None)
+                if (
+                    old is not None
+                    and new is not None
+                    and new is not old
+                    and old.shape == new.shape
+                ):
+                    old.copy_(new)
+                    meta.scheduler_metadata = old
 
     def _generate_draft(
         self,
@@ -438,8 +555,323 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Every draft logits write goes through sample_draft.
         return True
 
+    def elastic_query_lengths(self, num_reqs: int, **kwargs) -> np.ndarray | None:
+        """Query rows per request, or None to keep the fixed block. Ours overrides this."""
+        return None
+
+    def _draft_profile_begin(self, dummy_run: bool, num_reqs: int) -> bool:
+        if dummy_run or not self._prof_enabled:
+            return False
+        if self._prof_start is None:
+            self._prof_start = torch.cuda.Event(enable_timing=True)
+            self._prof_end = torch.cuda.Event(enable_timing=True)
+        if self._prof_hold is not None:
+            start, end, n = self._prof_hold
+            end.synchronize()
+            ms = start.elapsed_time(end)
+            self._prof_hold = None
+            if n >= self._prof_min_reqs:
+                self._prof_samples.append((n, ms))
+                logger.info("ELASTIC_DRAFTER ms=%.3f reqs=%d", ms, n)
+                full = [t for r, t in self._prof_samples if r == n]
+                if len(full) == self._prof_skip + self._prof_keep:
+                    window = full[self._prof_skip :]
+                    window.sort()
+                    mid = window[len(window) // 2]
+                    logger.info(
+                        "ELASTIC_DRAFTER_MEDIAN ms=%.3f reqs=%d n=%d skip=%d",
+                        mid,
+                        n,
+                        len(window),
+                        self._prof_skip,
+                    )
+        assert self._prof_start is not None and self._prof_end is not None
+        self._prof_start.record()
+        self._prof_hold_n = num_reqs
+        return True
+
+    def _draft_profile_end(self, active: bool) -> None:
+        if not active or self._prof_end is None or self._prof_start is None:
+            return
+        self._prof_end.record()
+        self._prof_hold = (self._prof_start, self._prof_end, self._prof_hold_n)
+        self._prof_start = torch.cuda.Event(enable_timing=True)
+        self._prof_end = torch.cuda.Event(enable_timing=True)
+
+    def _propose_varlen(
+        self,
+        input_batch: InputBatch,
+        num_reqs: int,
+        num_target_tokens: int,
+        q_lens: np.ndarray,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        dummy_run: bool,
+    ) -> torch.Tensor:
+        """One bidirectional forward over q_i = 4 g_i query rows per request.
+
+        g_i = 0 writes this step's context K/V and contributes no query row.
+        Attention uses the packed query_start_loc with causal=False. The 2-tap
+        conv reads pos_in_block, so a short block does not consume the previous
+        request's tail.
+        """
+        if getattr(self, "_elastic_use_async", False):
+            self._elastic_use_async = False
+            ef = getattr(self, "_elastic_full", None)
+            if ef is not None:
+                ef.replay_async(
+                    input_batch,
+                    num_reqs,
+                    num_target_tokens,
+                    last_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                )
+                return self.draft_tokens[:num_reqs]
+        q_lens = np.asarray(q_lens, dtype=np.int32)
+        if q_lens.shape != (num_reqs,):
+            raise ValueError(
+                f"elastic query lengths {q_lens.shape} for {num_reqs} requests"
+            )
+        q_cu = np.zeros(num_reqs + 1, dtype=np.int32)
+        np.cumsum(q_lens, out=q_cu[1:])
+        d_lens = np.maximum(q_lens - 1, 0)
+        self._varlen_d = d_lens
+        replay = getattr(self, "_elastic_full_replay", None)
+        if (
+            replay is not None
+            and int(q_cu[-1]) > 0
+            and replay(
+                q_lens,
+                input_batch,
+                num_reqs,
+                num_target_tokens,
+                last_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                dummy_run,
+            )
+        ):
+            self._varlen_d = None
+            flush = getattr(self, "_flush_elastic_publish", None)
+            if flush is not None:
+                flush()
+            return self.draft_tokens[:num_reqs]
+        flush = getattr(self, "_flush_elastic_publish", None)
+        if flush is not None:
+            flush()
+        num_query_tokens = int(q_cu[-1])
+        max_q = int(q_lens.max()) if num_reqs else 0
+        # A captured graph freezes this host int. Use the model limit, and set
+        # it before the scheduler tensor is built: raising the field afterwards
+        # makes FA3 reject scheduler_metadata, and a tight bound from the first
+        # step under-attends once the context grows past it.
+        self.draft_max_seq_len = int(self.max_model_len)
+
+        if self._query_cu_gpu is None:
+            self._query_cu_gpu = torch.empty(
+                self.max_num_reqs + 1, dtype=torch.int32, device=self.device
+            )
+            self._pos_in_block = torch.empty(
+                self.max_num_tokens, dtype=torch.int32, device=self.device
+            )
+        assert self._query_cu_gpu is not None and self._pos_in_block is not None
+        self._query_cu_gpu[: num_reqs + 1].copy_(
+            torch.from_numpy(q_cu), non_blocking=True
+        )
+
+        assert self.draft_kv_cache_group_id >= 0
+        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            prepare_dflash_inputs(
+                self.input_buffers,
+                self.block_tables.slot_mappings[gid],
+                self.context_positions,
+                self._context_slot_mappings[i],
+                self.sample_indices,
+                self.sample_pos,
+                self.sample_idx_mapping,
+                self.temperature,
+                self.seeds,
+                input_batch,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                self.block_tables.input_block_tables[gid],
+                self.block_tables.block_sizes[gid],
+                self.block_tables.cp_rank,
+                self.dcp_size,
+                self.block_tables.cp_interleave,
+                self.parallel_drafting_token_id,
+                max(max_q, 1),
+                self.num_speculative_steps,
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.max_model_len,
+                self.sample_from_anchor,
+                num_reqs,
+                self.group_size,
+                query_cu=self._query_cu_gpu,
+                pos_in_block=self._pos_in_block,
+            )
+
+        self._store_hidden_states(
+            num_target_tokens, last_hidden_states, aux_hidden_states
+        )
+        self.prepare_context_anchor(num_reqs, input_batch.query_start_loc, num_rejected)
+        self._precompute_context_kv(0, num_target_tokens, dummy_run)
+
+        if num_query_tokens == 0:
+            self.draft_tokens[:num_reqs].fill_(self.parallel_drafting_token_id)
+            self._varlen_d = None
+            flush = getattr(self, "_flush_elastic_publish", None)
+            if flush is not None:
+                flush()
+            return self.draft_tokens[:num_reqs]
+        flush = getattr(self, "_flush_elastic_publish", None)
+        if flush is not None:
+            flush()
+
+        # A captured graph already holds views of the buffers the prepare
+        # kernel just overwrote. Rebuilding attention metadata here only to
+        # throw it away on replay is a host stall inside drafter_ms. The key
+        # is the query layout, so an interleaved batch replays too.
+        self._elastic_pending_key = q_cu.tobytes()
+        entry = (getattr(self, "_elastic_graphs", None) or {}).get(
+            self._elastic_pending_key
+        )
+        replay = (
+            os.environ.get("VLLM_ELASTIC_GRAPH", "1") == "1"
+            and entry is not None
+            and entry["tokens"] == num_query_tokens
+        )
+        if replay:
+            draft_attn_metadata = entry["meta"]
+        else:
+            query_start_loc_np = q_cu
+            batch_desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_query_tokens,
+                num_reqs=None,
+            )
+            draft_attn_metadata = self._build_attn_metadata(
+                num_reqs=num_reqs,
+                batch_desc=batch_desc,
+                query_start_loc_np=query_start_loc_np,
+                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                step=max_q,
+                causal=self._group_causal,
+            )
+        self._prepare_eplb_forward(num_query_tokens)
+        draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
+            self.block_tables.slot_mappings[:, :num_query_tokens],
+            self.kv_cache_config,
+        )
+        self._set_conv_positions(self._pos_in_block[:num_query_tokens])
+        try:
+            self._generate_draft(
+                num_reqs,
+                num_query_tokens,
+                draft_attn_metadata,
+                draft_slot_mappings_by_layer,
+                num_tokens_across_dp=None,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            )
+        finally:
+            self._set_conv_positions(None)
+            self._varlen_d = None
+        return self.draft_tokens[:num_reqs]
+
+    def _set_conv_positions(self, pos: torch.Tensor | None) -> None:
+        """Copy packed offsets into the conv buffers. Never swaps None for a tensor.
+
+        The compiled forward always calls ``dflash2_grouped_conv_at``. A zero
+        ``_pos_enabled`` keeps ``row % block_size``.
+        """
+        layers = getattr(getattr(self.model, "model", None), "layers", None)
+        if layers is None:
+            return
+        for layer in layers:
+            for name in ("attention_conv", "mlp_conv"):
+                conv = getattr(layer, name, None)
+                if conv is None or not hasattr(conv, "_pos_enabled"):
+                    continue
+                if pos is None:
+                    conv._pos_enabled.fill_(0)
+                    continue
+                n = pos.shape[0]
+                if n > conv._pos_in_block.shape[0]:
+                    raise RuntimeError(
+                        f"varlen conv positions {n} exceed {conv._pos_in_block.shape[0]}"
+                    )
+                conv._pos_in_block[:n].copy_(pos)
+                conv._pos_enabled.fill_(1)
+
     @torch.inference_mode()
     def propose(
+        self,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor],
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        dp_sync_state: DPSyncState | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        is_profile: bool = False,
+        num_speculative_tokens: int | None = None,
+    ) -> torch.Tensor:
+        active = self._draft_profile_begin(dummy_run, input_batch.num_reqs)
+        try:
+            return self._propose_unprofiled(
+                input_batch,
+                attn_metadata,
+                slot_mappings,
+                last_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                dp_sync_state,
+                dummy_run,
+                skip_attn_for_dummy_run,
+                mm_inputs,
+                is_profile,
+                num_speculative_tokens,
+            )
+        finally:
+            self._draft_profile_end(active)
+
+    @torch.inference_mode()
+    def _propose_unprofiled(
         self,
         input_batch: InputBatch,
         attn_metadata: dict[str, Any],
@@ -511,6 +943,43 @@ class DFlashSpeculator(DraftModelSpeculator):
         if self.pcp_manager is not None and not dummy_run:
             self.block_tables.gather_block_tables(
                 input_batch.idx_mapping, num_reqs_padded=num_reqs
+            )
+
+        # Dummy and profile runs keep the fixed block so CUDA-graph capture and
+        # the memory profile still see the full 16-row shape. Elastic drafting
+        # is eager and only replaces real decode steps.
+        q_lens = (
+            None
+            if num_speculative_tokens == 0 or dummy_run or is_profile
+            else self.elastic_query_lengths(
+                num_reqs,
+                input_batch=input_batch,
+                num_target_tokens=last_hidden_states.shape[0],
+                last_hidden_states=last_hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                next_prefill_tokens=next_prefill_tokens,
+                temperature=temperature,
+                seeds=seeds,
+            )
+        )
+        if q_lens is not None:
+            return self._propose_varlen(
+                input_batch,
+                num_reqs,
+                num_target_tokens,
+                q_lens,
+                last_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                dummy_run,
             )
 
         # The query slot mapping is written into the shared BlockTables slot_mappings.
@@ -681,16 +1150,51 @@ def _prepare_dflash_inputs_kernel(
     max_num_tokens,
     max_model_len,
     cp_rank,
+    query_cu_ptr,
+    pos_ptr,
+    live_reqs_ptr,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    VARLEN: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
     num_reqs = tl.num_programs(0)
+    if VARLEN:
+        live = tl.load(live_reqs_ptr)
+        if req_idx >= live:
+            # Inactive slot. The last program still publishes the packed tail
+            # so query_start_loc / sample rows past the live batch stay inert.
+            if req_idx == num_reqs - 1 and block_idx == 0:
+                q_tot = tl.load(query_cu_ptr + live)
+                for i in range(0, max_num_reqs + 1, BLOCK_SIZE):
+                    block = i + tl.arange(0, BLOCK_SIZE)
+                    mask = (block >= live) & (block < max_num_reqs + 1)
+                    tl.store(out_query_start_loc_ptr + block, q_tot, mask=mask)
+                for i in range(0, max_num_reqs, BLOCK_SIZE):
+                    block = i + tl.arange(0, BLOCK_SIZE)
+                    mask = (block >= live) & (block < max_num_reqs)
+                    tl.store(out_seq_lens_ptr + block, 0, mask=mask)
+                pad_start = live * num_speculative_steps
+                pad_end = max_num_reqs * num_speculative_steps
+                for i in range(0, max_num_reqs * num_speculative_steps, BLOCK_SIZE):
+                    block = i + tl.arange(0, BLOCK_SIZE)
+                    mask = (block >= pad_start) & (block < pad_end)
+                    tl.store(out_sample_indices_ptr + block, 0, mask=mask)
+                    tl.store(out_sample_pos_ptr + block, 0, mask=mask)
+                    tl.store(out_sample_idx_mapping_ptr + block, -1, mask=mask)
+                for i in range(0, max_num_tokens, BLOCK_SIZE):
+                    block = i + tl.arange(0, BLOCK_SIZE)
+                    mask = (block >= q_tot) & (block < max_num_tokens)
+                    tl.store(out_input_ids_ptr + block, 0, mask=mask)
+                    tl.store(out_query_positions_ptr + block, 0, mask=mask)
+                    tl.store(out_is_padding_ptr + block, True, mask=mask)
+                    tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
+            return
     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
 
     ctx_start = tl.load(target_query_start_loc_ptr + req_idx)
@@ -709,12 +1213,17 @@ def _prepare_dflash_inputs_kernel(
         bonus_token = tl.load(next_prefill_tokens_ptr + req_state_idx).to(tl.int32)
 
     last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
-    query_base = req_idx * num_query_per_req
+    if VARLEN:
+        query_base = tl.load(query_cu_ptr + req_idx)
+        num_q = tl.load(query_cu_ptr + req_idx + 1) - query_base
+    else:
+        query_base = req_idx * num_query_per_req
+        num_q = num_query_per_req
 
     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     is_ctx = j < num_ctx
     is_valid_ctx = j < num_valid_ctx
-    is_query = (j >= num_valid_ctx) & (j < num_valid_ctx + num_query_per_req)
+    is_query = (j >= num_valid_ctx) & (j < num_valid_ctx + num_q)
     query_off = j - num_valid_ctx
 
     # --- Context positions / slots ---
@@ -785,6 +1294,10 @@ def _prepare_dflash_inputs_kernel(
     )
 
     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
+    if VARLEN:
+        # 0 on the anchor row, so the 2-tap conv masks tap=1 there even when the
+        # next request starts at a shorter offset than block_size.
+        tl.store(pos_ptr + query_idx, query_off, mask=is_query)
     tl.store(out_is_padding_ptr + query_idx, False, mask=is_query)
     clamped_query_pos = tl.minimum(logical_pos, max_model_len - 1)
     tl.store(out_query_positions_ptr + query_idx, clamped_query_pos, mask=is_query)
@@ -811,7 +1324,7 @@ def _prepare_dflash_inputs_kernel(
         # tokens this step.
         tl.store(
             out_seq_lens_ptr + req_idx,
-            tl.minimum(last_valid_pos + 1 + num_query_per_req, max_model_len),
+            tl.minimum(last_valid_pos + 1 + num_q, max_model_len),
         )
         # Copy sampling state.
         tl.store(
@@ -819,9 +1332,25 @@ def _prepare_dflash_inputs_kernel(
             tl.load(temperature_ptr + req_state_idx),
         )
         tl.store(out_seeds_ptr + req_state_idx, tl.load(seeds_ptr + req_state_idx))
+        if VARLEN and block_idx == 0:
+            # All 15 slots of an active request must carry req_state_idx so
+            # _selector_walk_kernel (even when num_q == 0) and
+            # _cache_draft_logits_kernel (for s >= n_live) clear stale
+            # draft_logits and write pad_token one-hot proposals.
+            sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
+            n_live = tl.maximum(num_q - sample_off, 0)
+            for s in range(num_speculative_steps):
+                tl.store(
+                    out_sample_idx_mapping_ptr + req_idx * num_speculative_steps + s,
+                    req_state_idx,
+                    mask=s >= n_live,
+                )
         if req_idx == num_reqs - 1:
             # Pad per-request buffers to max_num_reqs for CUDA graph safety.
-            last_query_end = num_reqs * num_query_per_req
+            if VARLEN:
+                last_query_end = tl.load(query_cu_ptr + num_reqs)
+            else:
+                last_query_end = num_reqs * num_query_per_req
             for i in range(num_reqs, max_num_reqs + 1, BLOCK_SIZE):
                 block = i + tl.arange(0, BLOCK_SIZE)
                 mask = block < max_num_reqs + 1
@@ -845,7 +1374,7 @@ def _prepare_dflash_inputs_kernel(
             # Pad query slot mappings past num_query_tokens with PAD so the
             # captured CG sees PAD slots (no K/V write) for replay sizes
             # larger than the current request count.
-            q_pad_start = num_reqs * num_query_per_req
+            q_pad_start = last_query_end
             for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
                 block = i + tl.arange(0, BLOCK_SIZE)
                 mask = block < max_num_tokens
@@ -893,16 +1422,44 @@ def prepare_dflash_inputs(
     sample_from_anchor: bool = False,
     num_reqs_override: int | None = None,
     group_size: int = 1,
+    query_cu: torch.Tensor | None = None,
+    pos_in_block: torch.Tensor | None = None,
+    live_reqs: torch.Tensor | None = None,
+    fixed_blocks: int | None = None,
+    batch_positions: torch.Tensor | None = None,
+    batch_query_start_loc: torch.Tensor | None = None,
+    batch_idx_mapping: torch.Tensor | None = None,
 ) -> None:
     num_reqs = input_batch.num_reqs if num_reqs_override is None else num_reqs_override
-    assert num_reqs <= input_batch.num_reqs
+    if num_reqs_override is None:
+        assert num_reqs <= input_batch.num_reqs
     assert num_reqs > 0
     # Cover the longest possible per-request span (ctx + query). Use the max
     # per-request query length, not the total token count across the batch.
-    max_target_query_len = int(input_batch.num_scheduled_tokens[:num_reqs].max())
-    max_tokens_per_req = max_target_query_len + num_query_per_req
+    # A captured graph passes fixed_blocks so this launch does not sync.
     BLOCK_SIZE = 128
-    num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
+    if fixed_blocks is None:
+        max_target_query_len = int(input_batch.num_scheduled_tokens[:num_reqs].max())
+        max_tokens_per_req = max_target_query_len + num_query_per_req
+        num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
+    else:
+        num_blocks = fixed_blocks
+    if live_reqs is None:
+        cached = getattr(prepare_dflash_inputs, "_live", None)
+        if cached is None or cached.device != input_buffers.input_ids.device:
+            cached = torch.empty(
+                1, dtype=torch.int32, device=input_buffers.input_ids.device
+            )
+            prepare_dflash_inputs._live = cached
+        cached.fill_(num_reqs)
+        live_reqs = cached
+    positions_in = input_batch.positions if batch_positions is None else batch_positions
+    qsl_in = (
+        input_batch.query_start_loc
+        if batch_query_start_loc is None
+        else batch_query_start_loc
+    )
+    idx_in = input_batch.idx_mapping if batch_idx_mapping is None else batch_idx_mapping
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,
         input_buffers.positions,
@@ -917,9 +1474,9 @@ def prepare_dflash_inputs(
         sample_idx_mapping,
         temperature,
         seeds,
-        input_batch.positions,
-        input_batch.query_start_loc,
-        input_batch.idx_mapping,
+        positions_in,
+        qsl_in,
+        idx_in,
         last_sampled,
         next_prefill_tokens,
         num_sampled,
@@ -936,10 +1493,14 @@ def prepare_dflash_inputs(
         max_num_tokens,
         max_model_len,
         cp_rank,
+        query_cu if query_cu is not None else input_buffers.input_ids,
+        pos_in_block if pos_in_block is not None else input_buffers.input_ids,
+        live_reqs,
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         GROUP_SIZE=group_size,
         PAD_SLOT_ID=PAD_SLOT_ID,
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
+        VARLEN=query_cu is not None,
     )
