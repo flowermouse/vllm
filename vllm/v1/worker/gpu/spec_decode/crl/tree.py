@@ -327,6 +327,7 @@ def _prepare_tree_step_kernel(
     idx_mapping_ptr,  # [num_reqs] int64
     query_start_loc_ptr,  # [num_reqs + 1] int32
     num_computed_ptr,  # [max_num_reqs] int32 (prefix_len BEFORE this step)
+    is_tree_req_ptr,  # [num_reqs] uint8 (1 if req has tree drafts, 0 if prefill)
     tree_depths_ptr,  # [max_num_reqs, B1] int32
     tree_mask_ptr,  # [max_num_reqs, B1, B1] uint8
     positions_ptr,  # [num_tokens] int64 (in/out)
@@ -337,11 +338,15 @@ def _prepare_tree_step_kernel(
 ):
     r = tl.program_id(0)
     req_state = tl.load(idx_mapping_ptr + r)
+    pref_len = tl.load(num_computed_ptr + req_state)
+    tl.store(step_prefix_lens_ptr + r, pref_len)
+
+    if tl.load(is_tree_req_ptr + r) == 0:
+        return
+
     q_start = tl.load(query_start_loc_ptr + r)
     q_end = tl.load(query_start_loc_ptr + r + 1)
     q_len = q_end - q_start
-    pref_len = tl.load(num_computed_ptr + req_state)
-    tl.store(step_prefix_lens_ptr + r, pref_len)
 
     offs = tl.arange(0, BLOCK_B1)
     valid = offs < q_len
@@ -391,7 +396,12 @@ def _tree_verify_kernel(
         tl.store(out_sampled_ptr + r * B1 + j, -1)
         tl.store(out_acc_nodes_ptr + r * B1 + j, 0)
 
-    if n_logits <= 1:
+    if n_logits <= 0:
+        tl.store(out_num_sampled_ptr + r, 0)
+        tl.store(out_num_rejected_ptr + r, 0)
+        return
+
+    if n_logits == 1:
         # Non-speculative request (e.g., prefill-only): accept single sampled token
         tok0 = tl.load(target_tokens_ptr + l_start)
         tl.store(out_sampled_ptr + r * B1 + 0, tok0)
@@ -734,6 +744,9 @@ class CRLTreeState:
         self.step_prefix_lens = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
         )
+        self.step_is_tree_req = torch.ones(
+            max_num_reqs, dtype=torch.uint8, device=device
+        )
         self.step_tree_mask = torch.zeros(
             max_num_reqs, self.b1, self.b1, dtype=torch.uint8, device=device
         )
@@ -802,12 +815,20 @@ class CRLTreeState:
         num_computed_tokens: torch.Tensor,
         positions: torch.Tensor,
         num_reqs: int,
+        is_tree_req_np=None,
     ) -> None:
+        if is_tree_req_np is not None:
+            self.step_is_tree_req[:num_reqs].copy_(
+                torch.from_numpy(is_tree_req_np), non_blocking=True
+            )
+        else:
+            self.step_is_tree_req[:num_reqs].fill_(1)
         BLOCK_B1 = triton.next_power_of_2(self.b1)
         _prepare_tree_step_kernel[(num_reqs,)](
             idx_mapping,
             query_start_loc,
             num_computed_tokens,
+            self.step_is_tree_req,
             self.tree_depths,
             self.tree_mask,
             positions,

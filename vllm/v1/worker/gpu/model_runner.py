@@ -1583,25 +1583,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # CRL Zero-Cost Conditional Tree: save contiguous positions for KV slot
         # allocation, then overwrite RoPE positions with prefix_len + tree_depth.
+        # Active whenever any request has tree drafts (including mixed prefill+decode steps!).
         tree_state = getattr(self.speculator, "tree_state", None)
-        if (
-            tree_state is not None
-            and not batch_req_state.has_prefill
-            and total_num_draft_tokens > 0
-        ):
+        if tree_state is not None and total_num_draft_tokens > 0:
             self._tree_linear_positions = self.input_buffers.positions[
                 :num_tokens_after_padding
             ].clone()
+            assert num_draft_tokens_per_req is not None
+            is_tree_req_np = (num_draft_tokens_per_req > 0).astype(np.uint8)
             tree_state.prepare_step(
                 idx_mapping,
                 query_start_loc,
                 self.req_states.num_computed_tokens.gpu,
                 self.input_buffers.positions,
                 num_reqs,
+                is_tree_req_np=is_tree_req_np,
             )
             self._active_tree_step = True
+            self._active_tree_mixed = bool(
+                batch_req_state.has_prefill or not bool(is_tree_req_np.all())
+            )
+            if self._active_tree_mixed:
+                self._active_tree_mixed_ids = [
+                    int(i) for i in range(num_reqs) if is_tree_req_np[i]
+                ]
+                self._active_tree_mixed_ranges = [
+                    (int(query_start_loc_np[i]), int(query_start_loc_np[i + 1]))
+                    for i in self._active_tree_mixed_ids
+                ]
+            else:
+                self._active_tree_mixed_ids = None
+                self._active_tree_mixed_ranges = None
         else:
             self._active_tree_step = False
+            self._active_tree_mixed = False
+            self._active_tree_mixed_ids = None
+            self._active_tree_mixed_ranges = None
             self._tree_linear_positions = None
 
         # Some input token ids are directly read from the last sampled tokens
@@ -2157,6 +2174,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             m.tree_mask = tree_state.step_tree_mask[:nrp]
                             m.tree_prefix_lens = tree_state.step_prefix_lens[:nrp]
                             m.max_tree_prefix_len = max_pref
+                            if (
+                                not is_dummy_tree_cap
+                                and getattr(self, "_active_tree_mixed", False)
+                            ):
+                                m.tree_mixed_req_ids = self._active_tree_mixed_ids
+                                m.tree_mixed_q_ranges = self._active_tree_mixed_ranges
+                                m.tree_b1 = tree_state.b1
 
         input_ids = input_batch.input_ids
         inputs_embeds = None

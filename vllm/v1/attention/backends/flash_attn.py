@@ -554,6 +554,9 @@ class FlashAttentionMetadata:
     tree_prefix_lens: torch.Tensor | None = None
     max_tree_prefix_len: int = 0
     tree_prefix_out_buf: torch.Tensor | None = None
+    tree_mixed_req_ids: list[int] | None = None
+    tree_mixed_q_ranges: list[tuple[int, int]] | None = None
+    tree_b1: int = 0
 
     # PrefixLM bidirectional range containing each scheduled query token.
     # Shape: (num_actual_tokens, 2) int32, absolute [start, end] bounds;
@@ -1417,6 +1420,83 @@ class FlashAttentionImpl(AttentionImpl):
                 k_act = key[:num_actual_tokens]
                 v_act = value[:num_actual_tokens]
                 out_act = output[:num_actual_tokens]
+
+                if attn_metadata.tree_mixed_req_ids is not None:
+                    # Mixed prefill + tree decode step (eager/piecewise only):
+                    # 1) Run standard causal FA3 for the whole batch (exact for all prefill/chain reqs).
+                    _FA4_DENSE_ATTENTION_KERNEL(
+                        q=q_act,
+                        k=key_cache,
+                        v=value_cache,
+                        out=out_act,
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=sliding_window_size,
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=attn_metadata.scheduler_metadata,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        num_splits=num_splits,
+                        s_aux=self.sinks,
+                    )
+                    # 2) Overwrite tree requests with exact Split-Tree FA3 + fused Triton.
+                    t_reqs = attn_metadata.tree_mixed_req_ids
+                    t_ranges = attn_metadata.tree_mixed_q_ranges
+                    assert t_ranges is not None
+                    if t_reqs:
+                        b1 = attn_metadata.tree_b1
+                        idx_t = torch.tensor(t_reqs, dtype=torch.int64, device=q_act.device)
+                        tok_slices = [torch.arange(s, e, device=q_act.device) for s, e in t_ranges]
+                        tok_idx = torch.cat(tok_slices, dim=0)
+                        qt = q_act[tok_idx].contiguous()
+                        kt = k_act[tok_idx].contiguous()
+                        vt = v_act[tok_idx].contiguous()
+                        cu_t = torch.zeros(len(t_reqs) + 1, dtype=torch.int32, device=q_act.device)
+                        pos_acc = 0
+                        for ii, (s, e) in enumerate(t_ranges):
+                            pos_acc += e - s
+                            cu_t[ii + 1] = pos_acc
+                        pref_t = attn_metadata.tree_prefix_lens[idx_t]
+                        bt_t = block_table[idx_t]
+                        mask_t = attn_metadata.tree_mask[idx_t]
+                        out_p_t = torch.empty_like(qt)
+                        out_p_t, lse_p_t = flash_attn_varlen_func(
+                            q=qt,
+                            k=key_cache,
+                            v=value_cache,
+                            out=out_p_t,
+                            cu_seqlens_q=cu_t,
+                            max_seqlen_q=b1,
+                            seqused_k=pref_t,
+                            max_seqlen_k=max(1, attn_metadata.max_tree_prefix_len),
+                            softmax_scale=self.scale,
+                            causal=False,
+                            alibi_slopes=self.alibi_slopes,
+                            window_size=sliding_window_size,
+                            block_table=bt_t,
+                            softcap=self.logits_soft_cap,
+                            return_softmax_lse=True,
+                            fa_version=self.vllm_flash_attn_version,
+                            q_descale=q_descale,
+                            k_descale=k_descale,
+                            v_descale=v_descale,
+                        )
+                        out_tree = torch.empty_like(qt)
+                        fused_intra_tree_and_merge_varlen(
+                            qt, kt, vt, out_p_t, lse_p_t, mask_t, cu_t, pref_t,
+                            out_tree, self.scale, len(t_reqs), b1,
+                        )
+                        out_act[tok_idx] = out_tree
+                    return output
+
                 out_p = (
                     attn_metadata.tree_prefix_out_buf[:num_actual_tokens]
                     if attn_metadata.tree_prefix_out_buf is not None
