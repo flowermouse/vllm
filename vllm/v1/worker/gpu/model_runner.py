@@ -312,6 +312,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
+        # CRL Zero-Cost Conditional Tree per-step state
+        self.target_kv_caches: list[torch.Tensor] = []
+        self._active_tree_step: bool = False
+        self._step_acc_nodes: torch.Tensor | None = None
+        self._step_block_table: torch.Tensor | None = None
+        self._tree_linear_positions: torch.Tensor | None = None
 
         # Built before memory profiling; block tables are attached at KV init.
         self.pcp_manager = pcp.maybe_build_pcp_manager(
@@ -859,6 +865,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        _draft_names = (
+            self.speculator.draft_attn_layer_names
+            if isinstance(self.speculator, DraftModelSpeculator)
+            else set()
+        )
+        self.target_kv_caches = [
+            cache
+            for name, cache in kv_caches_dict.items()
+            if cache.device == self.device and name not in _draft_names
+        ]
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
@@ -1174,6 +1190,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         lora_capture_hook=create_lora_capture_hook(
                             self.lora_config, self
                         ),
+                        tree_state=getattr(self.speculator, "tree_state", None),
                     )
                     self.model_state.capture_inner_cudagraphs(
                         input_buffers,
@@ -1564,6 +1581,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
+        # CRL Zero-Cost Conditional Tree: save contiguous positions for KV slot
+        # allocation, then overwrite RoPE positions with prefix_len + tree_depth.
+        tree_state = getattr(self.speculator, "tree_state", None)
+        if (
+            tree_state is not None
+            and not batch_req_state.has_prefill
+            and total_num_draft_tokens > 0
+        ):
+            self._tree_linear_positions = self.input_buffers.positions[
+                :num_tokens_after_padding
+            ].clone()
+            tree_state.prepare_step(
+                idx_mapping,
+                query_start_loc,
+                self.req_states.num_computed_tokens.gpu,
+                self.input_buffers.positions,
+                num_reqs,
+            )
+            self._active_tree_step = True
+        else:
+            self._active_tree_step = False
+            self._tree_linear_positions = None
+
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
         logits_indices = combine_sampled_and_draft_tokens(
@@ -1665,12 +1705,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
+        slot_positions = (
+            self._tree_linear_positions
+            if (self._active_tree_step and self._tree_linear_positions is not None)
+            else input_batch.positions
+        )
         slot_mappings = self.block_tables.compute_slot_mappings(
             input_batch.idx_mapping,
             input_batch.query_start_loc,
-            input_batch.positions,
+            slot_positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
         )
+        if self._active_tree_step:
+            self._step_block_table = block_tables[0]
         return block_tables, slot_mappings
 
     def prepare_dummy_attn(
@@ -1740,6 +1787,53 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         elif input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
+        elif (
+            self._active_tree_step
+            and input_batch.num_draft_tokens > 0
+            and getattr(self.speculator, "tree_state", None) is not None
+        ):
+            assert self.sampler is not None
+            tree_state = self.speculator.tree_state
+            _ss = self.sampler.sampling_states
+            _all_greedy = (
+                _ss.all_greedy(input_batch.idx_mapping_np)
+                if hasattr(_ss, "all_greedy")
+                else bool((_ss.temperature.np[input_batch.idx_mapping_np] == 0.0).all())
+            )
+            _has_pen = bool(
+                self.sampler.penalties_state.use_penalty[
+                    input_batch.idx_mapping_np
+                ].any()
+            )
+            if _all_greedy and not _has_pen:
+                target_tokens = logits.argmax(dim=-1)
+            else:
+                target_tokens, _ = self.sampler.sample(
+                    logits,
+                    input_batch.expanded_idx_mapping,
+                    input_batch.idx_mapping,
+                    input_batch.idx_mapping_np,
+                    input_batch.positions[input_batch.logits_indices],
+                    input_batch.input_ids[input_batch.logits_indices],
+                    input_batch.expanded_local_pos,
+                    input_batch.seq_lens_cpu_upper_bound.numpy(),
+                )
+            sampled_token_ids, acc_nodes, num_sampled, num_rejected = (
+                tree_state.verify_trees(
+                    target_tokens,
+                    input_batch.idx_mapping,
+                    input_batch.cu_num_logits,
+                    input_batch.num_reqs,
+                )
+            )
+            self._step_acc_nodes = acc_nodes
+            sampler_output = SamplerOutput(
+                sampled_token_ids=sampled_token_ids,
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+            )
         else:
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None
@@ -2032,6 +2126,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+            tree_state = getattr(self.speculator, "tree_state", None)
+            if tree_state is not None and attn_metadata is not None:
+                is_dummy_tree_cap = (
+                    dummy_run
+                    and batch_desc.cg_mode == CUDAGraphMode.FULL
+                    and not skip_attn_for_dummy_run
+                    and input_batch.num_reqs_after_padding <= tree_state.max_num_reqs
+                    and (
+                        input_batch.num_tokens_after_padding
+                        <= input_batch.num_reqs_after_padding * tree_state.b1
+                    )
+                )
+                if self._active_tree_step or is_dummy_tree_cap:
+                    nrp = input_batch.num_reqs_after_padding
+                    if is_dummy_tree_cap:
+                        tree_state.step_prefix_lens[:nrp].fill_(1)
+                        max_pref = self.max_model_len
+                    else:
+                        max_pref = (
+                            self.max_model_len
+                            if batch_desc.cg_mode == CUDAGraphMode.FULL
+                            else max(
+                                1,
+                                int(input_batch.seq_lens_cpu_upper_bound.max().item()),
+                            )
+                        )
+                    for m in attn_metadata.values():
+                        if hasattr(m, "tree_mask"):
+                            m.tree_mask = tree_state.step_tree_mask[:nrp]
+                            m.tree_prefix_lens = tree_state.step_prefix_lens[:nrp]
+                            m.max_tree_prefix_len = max_pref
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -2269,6 +2394,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if probe is not None:
             probe.end_sample()
+
+        if (
+            self._active_tree_step
+            and self._step_acc_nodes is not None
+            and getattr(self.speculator, "tree_state", None) is not None
+        ):
+            self.speculator.tree_state.compact_kv_and_hidden(
+                self.target_kv_caches,
+                self._step_block_table,
+                input_batch.num_reqs,
+                self._step_acc_nodes,
+                num_sampled,
+                input_batch.query_start_loc,
+                draft_hidden_states=draft_hidden_states,
+                aux_hidden_states=aux_hidden_states,
+            )
+            self._active_tree_step = False
+            self._step_acc_nodes = None
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).

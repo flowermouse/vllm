@@ -549,6 +549,12 @@ class FlashAttentionMetadata:
 
     causal: bool | torch.Tensor = True
 
+    # CRL Zero-Cost Conditional Tree Verification (Split-Tree FA3 + fused Triton)
+    tree_mask: torch.Tensor | None = None
+    tree_prefix_lens: torch.Tensor | None = None
+    max_tree_prefix_len: int = 0
+    tree_prefix_out_buf: torch.Tensor | None = None
+
     # PrefixLM bidirectional range containing each scheduled query token.
     # Shape: (num_actual_tokens, 2) int32, absolute [start, end] bounds;
     # (-1, -1) for query tokens outside every multimodal range.
@@ -673,12 +679,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         if self.use_full_cuda_graph and scheduler_metadata is not None:
             n = scheduler_metadata.shape[0]
             assert self.scheduler_metadata is not None
-            self.scheduler_metadata[:n] = scheduler_metadata
+            self.scheduler_metadata[:n].copy_(scheduler_metadata)
             # NOTE(woosuk): We should zero out the rest of the scheduler
             # metadata to guarantee the correctness. Otherwise, some thread
             # blocks may use the invalid scheduler metadata and overwrite the
-            # output buffer.
-            self.scheduler_metadata[n:] = 0
+            # output buffer. zero_() stays a device kernel under CUDA-graph
+            # capture; a Python scalar store would be a forbidden host copy.
+            self.scheduler_metadata[n:].zero_()
             return self.scheduler_metadata[:n]
         return scheduler_metadata
 
@@ -1400,6 +1407,58 @@ class FlashAttentionImpl(AttentionImpl):
                 max_seqlen_k = num_pages * FA4_HD256_PAGE_SIZE
                 block_table = block_table[:, :num_pages]
                 num_splits = 1
+
+            if attn_metadata.tree_mask is not None:
+                from vllm.v1.worker.gpu.spec_decode.crl.tree import (
+                    fused_intra_tree_and_merge_varlen,
+                )
+
+                q_act = query[:num_actual_tokens]
+                k_act = key[:num_actual_tokens]
+                v_act = value[:num_actual_tokens]
+                out_act = output[:num_actual_tokens]
+                out_p = (
+                    attn_metadata.tree_prefix_out_buf[:num_actual_tokens]
+                    if attn_metadata.tree_prefix_out_buf is not None
+                    else torch.empty_like(out_act)
+                )
+                out_p, lse_p = flash_attn_varlen_func(
+                    q=q_act,
+                    k=key_cache,
+                    v=value_cache,
+                    out=out_p,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=attn_metadata.tree_prefix_lens,
+                    max_seqlen_k=max(1, attn_metadata.max_tree_prefix_len),
+                    softmax_scale=self.scale,
+                    causal=False,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=sliding_window_size,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    return_softmax_lse=True,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
+                num_reqs_tree = cu_seqlens_q.shape[0] - 1
+                fused_intra_tree_and_merge_varlen(
+                    q_act,
+                    k_act,
+                    v_act,
+                    out_p,
+                    lse_p,
+                    attn_metadata.tree_mask,
+                    cu_seqlens_q,
+                    attn_metadata.tree_prefix_lens,
+                    out_act,
+                    self.scale,
+                    num_reqs_tree,
+                    max_seqlen_q,
+                )
+                return output
 
             _FA4_DENSE_ATTENTION_KERNEL(
                 q=query[:num_actual_tokens],

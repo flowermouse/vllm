@@ -73,6 +73,29 @@ class CRLSpeculator(DFlash2Speculator):
         self._calib_rows: list = []
         self._calib_scores: torch.Tensor | None = None
         self._calib_valid: torch.Tensor | None = None
+        self.tree_state = None
+        if self.tree_budget > 0:
+            from vllm.v1.worker.gpu.spec_decode.crl.tree import (
+                CRLTreeState,
+                get_crl_tree_temp,
+            )
+
+            self.tree_state = CRLTreeState(
+                max_num_reqs=self.max_num_reqs,
+                budget=self.tree_budget,
+                draft_rows=self.num_speculative_steps,
+                top_k=self.top_k,
+                device=device,
+                max_branch=4,
+                temp=get_crl_tree_temp(),
+            )
+            logger.info(
+                "%s: Zero-Cost Conditional Tree enabled (budget=%d, draft_rows=%d, temp=%.2f)",
+                self._speculator_name,
+                self.tree_budget,
+                self.num_speculative_steps,
+                self.tree_state.temp,
+            )
         logger.info(
             "%s: %d rows, top-%d candidates, %d predecessors per row; at temperature > 0 the drafts are %s",
             self._speculator_name,
@@ -234,6 +257,35 @@ class CRLSpeculator(DFlash2Speculator):
                 slot_mappings,
                 num_tokens_across_dp,
                 cudagraph_runtime_mode,
+            )
+            return
+        if self.tree_state is not None:
+            last_hidden_states = self._run_model(
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode or CUDAGraphMode.NONE,
+            )
+            num_sample = num_reqs * self.num_speculative_steps
+            hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
+                num_reqs, self.num_speculative_steps, -1
+            )
+            candidate_ids, unary_logits = self.model.compute_candidates(
+                hidden_states.flatten(0, 1)
+            )
+            candidate_ids = candidate_ids.view(
+                num_reqs, self.num_speculative_steps, self.top_k
+            )
+            unary_logits = unary_logits.view_as(candidate_ids)
+            scores = self._score_candidates(candidate_ids, unary_logits, hidden_states)
+            self.tree_state.build_trees(
+                candidate_ids,
+                scores,
+                num_reqs,
+                self.sample_idx_mapping,
+                self.draft_tokens,
+                pad_token=self.parallel_drafting_token_id,
             )
             return
         kwargs = {}

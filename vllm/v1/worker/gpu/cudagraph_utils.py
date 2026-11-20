@@ -630,6 +630,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        tree_state: Any = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
@@ -750,6 +751,20 @@ class ModelCudaGraphManager(CudaGraphManager):
                 max_query_len=desc.max_query_len or desc.uniform_token_count,
                 pcp_manager=pcp_manager,
             )
+            if (
+                tree_state is not None
+                and desc.cg_mode == CUDAGraphMode.FULL
+                and attn_metadata is not None
+                and num_reqs <= tree_state.max_num_reqs
+                and (desc.max_query_len or desc.uniform_token_count) == tree_state.b1
+            ):
+                tree_state.step_prefix_lens[:num_reqs].fill_(1)
+                max_pref = self.vllm_config.model_config.max_model_len
+                for m in attn_metadata.values():
+                    if hasattr(m, "tree_mask"):
+                        m.tree_mask = tree_state.step_tree_mask[:num_reqs]
+                        m.tree_prefix_lens = tree_state.step_prefix_lens[:num_reqs]
+                        m.max_tree_prefix_len = max_pref
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)

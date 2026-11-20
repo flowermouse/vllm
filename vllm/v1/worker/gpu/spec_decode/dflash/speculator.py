@@ -57,6 +57,24 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
         super().__init__(vllm_config, device)
 
+        # CRL Zero-Cost Conditional Tree: scheduler schedules B tree draft tokens
+        # (self.draft_tokens has width B), while the DFlash/CRL drafter keeps its
+        # native trained block width (block_size - 1 = 15 rows).
+        from vllm.v1.worker.gpu.spec_decode.crl.tree import get_crl_tree_budget
+
+        self.tree_budget = get_crl_tree_budget()
+        if self.tree_budget > 0:
+            _df_cfg = (
+                getattr(self.draft_model_config.hf_config, "dflash_config", None) or {}
+            )
+            _native_rows = int(_df_cfg.get("block_size", 16)) - 1
+            if self.num_speculative_steps != self.tree_budget:
+                raise ValueError(
+                    f"VLLM_CRL_TREE_BUDGET={self.tree_budget} must equal "
+                    f"num_speculative_tokens={self.num_speculative_steps}"
+                )
+            self.num_speculative_steps = _native_rows
+
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
