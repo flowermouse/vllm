@@ -16,6 +16,7 @@ import os
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.sample.gumbel import _DRAFT_NOISE_SALT, murmur3_uniform32
 
 
 def get_crl_tree_budget() -> int:
@@ -26,6 +27,20 @@ def get_crl_tree_budget() -> int:
 def get_crl_tree_temp() -> float:
     """Temperature applied to CRL logits when computing node survival weights."""
     return float(os.environ.get("VLLM_CRL_TREE_TEMP", "1.09"))
+
+
+def get_crl_tree_stochastic_verify() -> bool:
+    """Whether T > 0 tree requests use stochastic without-replacement drafting
+    and recursive residual tree rejection sampling (default True; set 0 for
+    deterministic strict-match A/B fallback)."""
+    return os.environ.get("VLLM_CRL_TREE_STOCHASTIC_VERIFY", "1") == "1"
+
+
+def get_crl_tree_stoch_alpha_base() -> float:
+    """Base row-level acceptance estimate for rank-0 stochastic tree child
+    (alpha_1 = (base + (1 - base) * q_top) * recall_u). Default 0.50 gives the
+    exact midpoint (1 + q_top) / 2; set 0.0 for raw q_top weights."""
+    return float(os.environ.get("VLLM_CRL_TREE_STOCH_ALPHA_BASE", "0.50"))
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +55,9 @@ def _build_crl_tree_kernel(
     idx_mapping_ptr,  # [num_reqs * N] int64 (req_state_idx repeated N times)
     null_delta_ptr,  # [max_num_reqs, N, K_A] float32 (when HAS_NULL=True)
     null_beta_ptr,  # [N] float32 (when HAS_NULL=True)
+    temperature_ptr,  # [max_num_reqs] float32 (when STOCHASTIC_ENABLED=True)
+    seeds_ptr,  # [max_num_reqs] int64 (when STOCHASTIC_ENABLED=True)
+    sample_pos_ptr,  # [num_reqs * N] int64 (when STOCHASTIC_ENABLED=True)
     # Scratch buffers per req: [max_num_reqs, MAX_FRONTIER]
     f_w_ptr,  # float32
     f_parent_ptr,  # int32
@@ -53,9 +71,15 @@ def _build_crl_tree_kernel(
     out_depths_ptr,  # [max_num_reqs, B+1] int32 (indexed by req_state)
     out_mask_ptr,  # [max_num_reqs, B+1, B+1] uint8 (indexed by req_state)
     out_tree_toks_ptr,  # [max_num_reqs, B] int64 (indexed by req_state)
+    out_cand_ids_ptr,  # [max_num_reqs, B+1, K] int64 (indexed by req_state)
+    out_cand_probs_ptr,  # [max_num_reqs, B+1, K] float32 (indexed by req_state)
+    out_child_rank_ptr,  # [max_num_reqs, B+1] int32 (indexed by req_state)
+    out_is_stoch_ptr,  # [max_num_reqs] uint8 (indexed by req_state)
     inv_temp,
+    stoch_alpha_base,
     pad_token,
     HAS_NULL: tl.constexpr,
+    STOCHASTIC_ENABLED: tl.constexpr,
     K_A: tl.constexpr,
     N_ROWS: tl.constexpr,
     TOP_K: tl.constexpr,
@@ -77,50 +101,111 @@ def _build_crl_tree_kernel(
     offs_b1 = tl.arange(0, BLOCK_B1)
     b1_mask = offs_b1 < B1
 
+    req_temp = 0.0
+    req_seed = tl.cast(0, tl.int64)
+    base_pos = tl.cast(0, tl.int64)
+    is_stoch = False
+    if STOCHASTIC_ENABLED:
+        req_temp = tl.load(temperature_ptr + req_state).to(tl.float32)
+        if req_temp > 0.0:
+            is_stoch = True
+            req_seed = tl.load(seeds_ptr + req_state).to(tl.int64)
+            base_pos = tl.load(sample_pos_ptr + req * N_ROWS).to(tl.int64) - 1
+    tl.store(out_is_stoch_ptr + req_state, tl.where(is_stoch, 1, 0).to(tl.uint8))
+
     f_base = req * MAX_FRONTIER
     # Clear frontier weights to -1.0 (inactive)
     tl.store(f_w_ptr + f_base + offs_f, -1.0)
 
-    # Root node 0 (anchor): parent=-1, depth=0, mask[0, 0]=1
+    # Root node 0 (anchor): parent=-1, depth=0, child_rank=-1, mask[0, 0]=1
     p_base = req_state * B1
     m_base = req_state * B1 * B1
+    c_base = req_state * B1 * TOP_K
     tl.store(out_parents_ptr + p_base + 0, -1)
     tl.store(out_depths_ptr + p_base + 0, 0)
+    tl.store(out_child_rank_ptr + p_base + 0, -1)
     root_mask = (offs_b1 == 0).to(tl.uint8)
     tl.store(out_mask_ptr + m_base + offs_b1, root_mask, mask=b1_mask)
 
     # Compute row 0 softmax probabilities: scores[req, 0, 0, 0..K-1]
     s0_base = (req * N_ROWS * TOP_K + 0) * TOP_K
-    s0 = (
-        tl.load(scores_ptr + s0_base + offs_k, mask=k_mask, other=float("-inf")).to(
-            tl.float32
-        )
-        * inv_temp
-    )
+    s0_raw = tl.load(
+        scores_ptr + s0_base + offs_k, mask=k_mask, other=float("-inf")
+    ).to(tl.float32)
+    eff_inv_t0 = (1.0 / req_temp) if is_stoch else inv_temp
+    s0 = s0_raw * eff_inv_t0
     s0_max = tl.max(s0, axis=0)
     e0 = tl.exp(s0 - s0_max)
     e0 = tl.where(k_mask, e0, 0.0)
-    p0 = e0 / tl.sum(e0, axis=0)
+    q0 = e0 / tl.sum(e0, axis=0)
+    p0 = q0
+    recall0 = 1.0
     if HAS_NULL:
         d0 = (
             tl.load(null_delta_ptr + (req * N_ROWS + 0) * K_A + 0).to(tl.float32)
             + tl.load(null_beta_ptr + 0).to(tl.float32)
         )
-        p0 = p0 * (1.0 / (1.0 + tl.exp(d0)))
+        recall0 = 1.0 / (1.0 + tl.exp(d0))
+        p0 = p0 * recall0
 
     # Push top MAX_BR children of root (row 0) into frontier slots 0..MAX_BR-1
     f_size = 0
-    rem_p0 = p0
-    for _ in range(MAX_BR):
-        best_r = tl.argmax(rem_p0, axis=0)
-        best_w = tl.max(rem_p0, axis=0)
-        if best_w > 0.0:
-            tl.store(f_w_ptr + f_base + f_size, best_w)
-            tl.store(f_parent_ptr + f_base + f_size, 0)
-            tl.store(f_row_ptr + f_base + f_size, 0)
-            tl.store(f_rank_ptr + f_base + f_size, best_r)
-            f_size += 1
-            rem_p0 = tl.where(offs_k == best_r, -1.0, rem_p0)
+    if is_stoch:
+        c0_ids = tl.load(
+            cand_ids_ptr + (req * N_ROWS + 0) * TOP_K + offs_k, mask=k_mask, other=0
+        )
+        tl.store(out_cand_ids_ptr + c_base + 0 * TOP_K + offs_k, c0_ids, mask=k_mask)
+        tl.store(out_cand_probs_ptr + c_base + 0 * TOP_K + offs_k, q0, mask=k_mask)
+        # Gumbel-Top-MAX_BR without-replacement sampling from q0, paired with
+        # deterministic sorted weights so each child's inclusion is statistically
+        # independent of its own sampled token and siblings always enter in exact
+        # sampling prefix order. When Null-Candidate probe is available (HAS_NULL),
+        # use its calibrated row recall R_u directly as rank-0 acceptance alpha0
+        # (zero manual hyperparameters!).
+        u0 = murmur3_uniform32(
+            req_seed, (base_pos << 8) ^ _DRAFT_NOISE_SALT, offs_k.to(tl.uint32)
+        )
+        g0 = tl.log(tl.maximum(q0, 1e-30)) - tl.log(-tl.log(tl.maximum(u0, 1e-7)))
+        g0 = tl.where(k_mask & (q0 > 1e-12), g0, -1e30)
+        rem_g0 = g0
+        rem_q0 = q0
+        q0_top = tl.max(q0, axis=0)
+        use_alpha0 = stoch_alpha_base > 0.0
+        alpha0 = (stoch_alpha_base + (1.0 - stoch_alpha_base) * q0_top) * recall0
+        rem_tail0 = tl.maximum(1e-6, 1.0 - q0_top)
+        for r_idx in range(MAX_BR):
+            best_r = tl.argmax(rem_g0, axis=0)
+            best_g = tl.max(rem_g0, axis=0)
+            det_r = tl.argmax(rem_q0, axis=0)
+            det_w = tl.max(rem_q0, axis=0)
+            if use_alpha0:
+                eff_w = tl.where(
+                    r_idx == 0,
+                    alpha0,
+                    (1.0 - alpha0) * (det_w / rem_tail0),
+                )
+            else:
+                eff_w = det_w
+            if (best_g > -1e20) & (eff_w > 0.0):
+                tl.store(f_w_ptr + f_base + f_size, eff_w)
+                tl.store(f_parent_ptr + f_base + f_size, 0)
+                tl.store(f_row_ptr + f_base + f_size, 0)
+                tl.store(f_rank_ptr + f_base + f_size, best_r)
+                f_size += 1
+                rem_g0 = tl.where(offs_k == best_r, -1e30, rem_g0)
+                rem_q0 = tl.where(offs_k == det_r, -1.0, rem_q0)
+    else:
+        rem_p0 = p0
+        for _ in range(MAX_BR):
+            best_r = tl.argmax(rem_p0, axis=0)
+            best_w = tl.max(rem_p0, axis=0)
+            if best_w > 0.0:
+                tl.store(f_w_ptr + f_base + f_size, best_w)
+                tl.store(f_parent_ptr + f_base + f_size, 0)
+                tl.store(f_row_ptr + f_base + f_size, 0)
+                tl.store(f_rank_ptr + f_base + f_size, best_r)
+                f_size += 1
+                rem_p0 = tl.where(offs_k == best_r, -1.0, rem_p0)
 
     # Iteratively pop highest-weight frontier node for node_id = 1..BUDGET
     for node_id in range(1, B1):
@@ -129,7 +214,7 @@ def _build_crl_tree_kernel(
         best_w = tl.max(fw, axis=0)
 
         if best_w <= 0.0:
-            # Degenerate fallback: attach pad_token to root
+            # Degenerate fallback: attach pad_token to root (child_rank = -1)
             tl.store(out_draft_tokens_ptr + req * BUDGET + (node_id - 1), pad_token)
             tl.store(
                 out_node_weights_ptr + req * out_node_weights_stride + (node_id - 1),
@@ -138,6 +223,7 @@ def _build_crl_tree_kernel(
             tl.store(out_tree_toks_ptr + req_state * BUDGET + (node_id - 1), pad_token)
             tl.store(out_parents_ptr + p_base + node_id, 0)
             tl.store(out_depths_ptr + p_base + node_id, 1)
+            tl.store(out_child_rank_ptr + p_base + node_id, -1)
             row_m = ((offs_b1 == 0) | (offs_b1 == node_id)).to(tl.uint8)
             tl.store(
                 out_mask_ptr + m_base + node_id * B1 + offs_b1, row_m, mask=b1_mask
@@ -158,6 +244,7 @@ def _build_crl_tree_kernel(
             tl.store(out_tree_toks_ptr + req_state * BUDGET + (node_id - 1), tok)
             tl.store(out_parents_ptr + p_base + node_id, par_id)
             tl.store(out_depths_ptr + p_base + node_id, row + 1)
+            tl.store(out_child_rank_ptr + p_base + node_id, rank)
 
             # Tree mask row: copy parent's mask row and set self bit
             par_m = tl.load(
@@ -172,37 +259,98 @@ def _build_crl_tree_kernel(
             next_row = row + 1
             if (next_row < N_ROWS) & (f_size + MAX_BR <= MAX_FRONTIER):
                 sn_base = ((req * N_ROWS + next_row) * TOP_K + rank) * TOP_K
-                sn = (
-                    tl.load(
-                        scores_ptr + sn_base + offs_k, mask=k_mask, other=float("-inf")
-                    ).to(tl.float32)
-                    * inv_temp
-                )
+                sn_raw = tl.load(
+                    scores_ptr + sn_base + offs_k, mask=k_mask, other=float("-inf")
+                ).to(tl.float32)
+                eff_inv_tn = (1.0 / req_temp) if is_stoch else inv_temp
+                sn = sn_raw * eff_inv_tn
                 sn_max = tl.max(sn, axis=0)
                 en = tl.exp(sn - sn_max)
                 en = tl.where(k_mask, en, 0.0)
-                pn = en / tl.sum(en, axis=0)
+                qn = en / tl.sum(en, axis=0)
+                pn = qn
+                recalln = 1.0
                 if HAS_NULL:
+                    beta_n = tl.load(null_beta_ptr + next_row).to(tl.float32)
                     if rank < K_A:
                         dn = (
                             tl.load(
                                 null_delta_ptr + (req * N_ROWS + next_row) * K_A + rank
                             ).to(tl.float32)
-                            + tl.load(null_beta_ptr + next_row).to(tl.float32)
+                            + beta_n
                         )
-                        pn = pn * (1.0 / (1.0 + tl.exp(dn)))
-                rem_pn = pn
-                for _ in range(MAX_BR):
-                    br = tl.argmax(rem_pn, axis=0)
-                    bw = tl.max(rem_pn, axis=0)
-                    wn = best_w * bw
-                    if wn > 0.0:
-                        tl.store(f_w_ptr + f_base + f_size, wn)
-                        tl.store(f_parent_ptr + f_base + f_size, node_id)
-                        tl.store(f_row_ptr + f_base + f_size, next_row)
-                        tl.store(f_rank_ptr + f_base + f_size, br)
-                        f_size += 1
-                        rem_pn = tl.where(offs_k == br, -1.0, rem_pn)
+                        recalln = 1.0 / (1.0 + tl.exp(dn))
+                        pn = pn * recalln
+                    else:
+                        recalln = 1.0 / (1.0 + tl.exp(beta_n))
+                if is_stoch:
+                    cn_ids = tl.load(
+                        cand_ids_ptr + (req * N_ROWS + next_row) * TOP_K + offs_k,
+                        mask=k_mask,
+                        other=0,
+                    )
+                    tl.store(
+                        out_cand_ids_ptr + c_base + node_id * TOP_K + offs_k,
+                        cn_ids,
+                        mask=k_mask,
+                    )
+                    tl.store(
+                        out_cand_probs_ptr + c_base + node_id * TOP_K + offs_k,
+                        qn,
+                        mask=k_mask,
+                    )
+                    un = murmur3_uniform32(
+                        req_seed,
+                        ((base_pos << 8) ^ node_id) ^ _DRAFT_NOISE_SALT,
+                        offs_k.to(tl.uint32),
+                    )
+                    gn = tl.log(tl.maximum(qn, 1e-30)) - tl.log(
+                        -tl.log(tl.maximum(un, 1e-7))
+                    )
+                    gn = tl.where(k_mask & (qn > 1e-12), gn, -1e30)
+                    rem_gn = gn
+                    rem_qn = qn
+                    qn_top = tl.max(qn, axis=0)
+                    use_alphan = stoch_alpha_base > 0.0
+                    alphan = (
+                        stoch_alpha_base + (1.0 - stoch_alpha_base) * qn_top
+                    ) * recalln
+                    rem_tailn = tl.maximum(1e-6, 1.0 - qn_top)
+                    for r_idx in range(MAX_BR):
+                        br = tl.argmax(rem_gn, axis=0)
+                        bg = tl.max(rem_gn, axis=0)
+                        det_r = tl.argmax(rem_qn, axis=0)
+                        det_bw = tl.max(rem_qn, axis=0)
+                        if use_alphan:
+                            eff_bw = tl.where(
+                                r_idx == 0,
+                                alphan,
+                                (1.0 - alphan) * (det_bw / rem_tailn),
+                            )
+                        else:
+                            eff_bw = det_bw
+                        wn = best_w * eff_bw
+                        if (bg > -1e20) & (wn > 0.0):
+                            tl.store(f_w_ptr + f_base + f_size, wn)
+                            tl.store(f_parent_ptr + f_base + f_size, node_id)
+                            tl.store(f_row_ptr + f_base + f_size, next_row)
+                            tl.store(f_rank_ptr + f_base + f_size, br)
+                            f_size += 1
+                            rem_gn = tl.where(offs_k == br, -1e30, rem_gn)
+                            rem_qn = tl.where(offs_k == det_r, -1.0, rem_qn)
+                else:
+                    rem_pn = pn
+                    for _ in range(MAX_BR):
+                        br = tl.argmax(rem_pn, axis=0)
+                        bw = tl.max(rem_pn, axis=0)
+                        wn = best_w * bw
+                        if wn > 0.0:
+                            tl.store(f_w_ptr + f_base + f_size, wn)
+                            tl.store(f_parent_ptr + f_base + f_size, node_id)
+                            tl.store(f_row_ptr + f_base + f_size, next_row)
+                            tl.store(f_rank_ptr + f_base + f_size, br)
+                            f_size += 1
+                            rem_pn = tl.where(offs_k == br, -1.0, rem_pn)
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +646,323 @@ def _tree_verify_kernel(
     tl.store(out_num_rejected_ptr + r, n_logits - step)
 
 
+@triton.jit
+def _vocab_argmax(row_ptr, vocab_size, BLOCK_V: tl.constexpr):
+    best_val = float("-inf")
+    best_idx = tl.cast(0, tl.int64)
+    for start in range(0, vocab_size, BLOCK_V):
+        offs = start + tl.arange(0, BLOCK_V)
+        mask = offs < vocab_size
+        vals = tl.load(row_ptr + offs, mask=mask, other=float("-inf")).to(tl.float32)
+        blk_max = tl.max(vals, axis=0)
+        blk_arg = tl.argmax(vals, axis=0).to(tl.int64) + start
+        if blk_max > best_val:
+            best_val = blk_max
+            best_idx = blk_arg
+    return best_idx
+
+
+@triton.jit
+def _vocab_lse(row_ptr, vocab_size, BLOCK_V: tl.constexpr):
+    max_val = float("-inf")
+    sum_exp = 0.0
+    for start in range(0, vocab_size, BLOCK_V):
+        offs = start + tl.arange(0, BLOCK_V)
+        mask = offs < vocab_size
+        vals = tl.load(row_ptr + offs, mask=mask, other=float("-inf")).to(tl.float32)
+        blk_max = tl.max(vals, axis=0)
+        new_max = tl.maximum(max_val, blk_max)
+        scale_old = tl.where(max_val > float("-inf"), tl.exp(max_val - new_max), 0.0)
+        blk_sum = tl.sum(
+            tl.where(mask & (vals > float("-inf")), tl.exp(vals - new_max), 0.0),
+            axis=0,
+        )
+        sum_exp = sum_exp * scale_old + blk_sum
+        max_val = new_max
+    return max_val + tl.log(tl.maximum(sum_exp, 1e-30))
+
+
+@triton.jit
+def _vocab_gumbel_sample(
+    row_ptr,
+    vocab_size,
+    seed,
+    pos_key,
+    cand_ids_ptr,
+    EXCLUDE_CANDS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    best_g = float("-inf")
+    best_idx = tl.cast(0, tl.int64)
+    for start in range(0, vocab_size, BLOCK_V):
+        offs = start + tl.arange(0, BLOCK_V)
+        mask = offs < vocab_size
+        vals = tl.load(row_ptr + offs, mask=mask, other=float("-inf")).to(tl.float32)
+        if EXCLUDE_CANDS:
+            for k in tl.static_range(TOP_K):
+                ck = tl.load(cand_ids_ptr + k)
+                vals = tl.where(offs == ck, float("-inf"), vals)
+        u = murmur3_uniform32(seed, pos_key, offs.to(tl.uint32))
+        g = vals - tl.log(-tl.log(tl.maximum(u, 1e-7)))
+        g = tl.where(mask & (vals > float("-inf")), g, float("-inf"))
+        blk_max = tl.max(g, axis=0)
+        blk_arg = tl.argmax(g, axis=0).to(tl.int64) + start
+        if blk_max > best_g:
+            best_g = blk_max
+            best_idx = blk_arg
+    return best_idx
+
+
+@triton.jit
+def _tree_verify_stochastic_kernel(
+    logits_ptr,  # [total_logits, V] (already processed by apply_sampling_params)
+    row_lse_ptr,  # [total_logits] float32 (precomputed in parallel across all SMs!)
+    logits_stride,
+    vocab_size,
+    idx_mapping_ptr,  # [num_reqs] int64
+    cu_num_logits_ptr,  # [num_reqs + 1] int32
+    positions_ptr,  # [total_logits] int64
+    seeds_ptr,  # [max_num_reqs] int64
+    temperature_ptr,  # [max_num_reqs] float32
+    tree_tokens_ptr,  # [max_num_reqs, B] int64
+    tree_parents_ptr,  # [max_num_reqs, B+1] int32
+    tree_cand_ids_ptr,  # [max_num_reqs, B+1, K] int64
+    tree_cand_probs_ptr,  # [max_num_reqs, B+1, K] float32
+    tree_child_rank_ptr,  # [max_num_reqs, B+1] int32
+    tree_is_stoch_ptr,  # [max_num_reqs] uint8
+    out_sampled_ptr,  # [num_reqs, B+1] int64 (-1 padded)
+    out_acc_nodes_ptr,  # [num_reqs, B+1] int32
+    out_num_sampled_ptr,  # [num_reqs] int32
+    out_num_rejected_ptr,  # [num_reqs] int32
+    BUDGET: tl.constexpr,
+    B1: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    r = tl.program_id(0)
+    req_state = tl.load(idx_mapping_ptr + r)
+    l_start = tl.load(cu_num_logits_ptr + r)
+    l_end = tl.load(cu_num_logits_ptr + r + 1)
+    n_logits = l_end - l_start
+
+    for j in range(B1):
+        tl.store(out_sampled_ptr + r * B1 + j, -1)
+        tl.store(out_acc_nodes_ptr + r * B1 + j, 0)
+
+    if n_logits <= 0:
+        tl.store(out_num_sampled_ptr + r, 0)
+        tl.store(out_num_rejected_ptr + r, 0)
+        return
+
+    temp = tl.load(temperature_ptr + req_state).to(tl.float32)
+    seed = tl.load(seeds_ptr + req_state).to(tl.int64)
+    is_stoch = tl.load(tree_is_stoch_ptr + req_state) != 0
+    p_base = req_state * B1
+    t_base = req_state * BUDGET
+    c_base = req_state * B1 * TOP_K
+
+    # Single-logit (prefill-only) request
+    if n_logits == 1:
+        row_ptr = logits_ptr + tl.cast(l_start, tl.int64) * logits_stride
+        if temp == 0.0:
+            tok = _vocab_argmax(row_ptr, vocab_size, BLOCK_V)
+        else:
+            pos0 = tl.load(positions_ptr + l_start).to(tl.int64)
+            tok = _vocab_gumbel_sample(
+                row_ptr, vocab_size, seed, pos0, tree_cand_ids_ptr, False, TOP_K, BLOCK_V
+            )
+        tl.store(out_sampled_ptr + r * B1 + 0, tok)
+        tl.store(out_acc_nodes_ptr + r * B1 + 0, 0)
+        tl.store(out_num_sampled_ptr + r, 1)
+        tl.store(out_num_rejected_ptr + r, 0)
+        return
+
+    # Greedy request inside a mixed batch (or deterministic tree fallback)
+    if (temp == 0.0) | (not is_stoch):
+        u = 0
+        step = 0
+        keep_going = True
+        for _ in range(B1):
+            if keep_going:
+                row_ptr = logits_ptr + tl.cast(l_start + u, tl.int64) * logits_stride
+                if temp == 0.0:
+                    t_star = _vocab_argmax(row_ptr, vocab_size, BLOCK_V)
+                else:
+                    pos_u = tl.load(positions_ptr + l_start + u).to(tl.int64)
+                    t_star = _vocab_gumbel_sample(
+                        row_ptr,
+                        vocab_size,
+                        seed,
+                        pos_u,
+                        tree_cand_ids_ptr,
+                        False,
+                        TOP_K,
+                        BLOCK_V,
+                    )
+                tl.store(out_sampled_ptr + r * B1 + step, t_star)
+                tl.store(out_acc_nodes_ptr + r * B1 + step, u)
+                step += 1
+                matched_v = -1
+                for v in range(1, B1):
+                    if (v < n_logits) & (matched_v < 0):
+                        pv = tl.load(tree_parents_ptr + p_base + v)
+                        if pv == u:
+                            tv = tl.load(tree_tokens_ptr + t_base + (v - 1))
+                            if tv == t_star:
+                                matched_v = v
+                if matched_v >= 0:
+                    u = matched_v
+                else:
+                    keep_going = False
+        tl.store(out_num_sampled_ptr + r, step)
+        tl.store(out_num_rejected_ptr + r, n_logits - step)
+        return
+
+    # Stochastic without-replacement recursive residual tree rejection sampling
+    offs_k = tl.arange(0, BLOCK_K)
+    k_mask = offs_k < TOP_K
+    u = 0
+    step = 0
+    keep_going = True
+
+    for _ in range(B1):
+        if keep_going:
+            tl.store(out_acc_nodes_ptr + r * B1 + step, u)
+            row_ptr = logits_ptr + tl.cast(l_start + u, tl.int64) * logits_stride
+            pos_u = tl.load(positions_ptr + l_start + u).to(tl.int64)
+
+            # Check if u has any valid children in 1..n_logits-1
+            has_child = False
+            for v in range(1, B1):
+                if v < n_logits:
+                    pv = tl.load(tree_parents_ptr + p_base + v)
+                    cr = tl.load(tree_child_rank_ptr + p_base + v)
+                    if (pv == u) & (cr >= 0):
+                        has_child = True
+
+            if not has_child:
+                # Leaf node: sample 1 bonus token directly from p_u
+                bonus = _vocab_gumbel_sample(
+                    row_ptr,
+                    vocab_size,
+                    seed,
+                    pos_u,
+                    tree_cand_ids_ptr,
+                    False,
+                    TOP_K,
+                    BLOCK_V,
+                )
+                tl.store(out_sampled_ptr + r * B1 + step, bonus)
+                step += 1
+                keep_going = False
+            else:
+                # Read precomputed parallel target LSE and sparse-support p_cand[16]
+                lse_u = tl.load(row_lse_ptr + l_start + u).to(tl.float32)
+                cand_u_ptr = tree_cand_ids_ptr + c_base + u * TOP_K
+                c_ids = tl.load(cand_u_ptr + offs_k, mask=k_mask, other=0)
+                q_orig = tl.load(
+                    tree_cand_probs_ptr + c_base + u * TOP_K + offs_k,
+                    mask=k_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                c_logits = tl.load(
+                    row_ptr + c_ids,
+                    mask=k_mask & (c_ids >= 0) & (c_ids < vocab_size),
+                    other=float("-inf"),
+                ).to(tl.float32)
+                p_cand = tl.where(
+                    k_mask & (c_logits > float("-inf")), tl.exp(c_logits - lse_u), 0.0
+                )
+
+                p_cur = p_cand
+                p_rest = tl.maximum(0.0, 1.0 - tl.sum(p_cand, axis=0))
+                rem_S = 1.0
+                used = tl.zeros([BLOCK_K], dtype=tl.int1)
+                accepted_v = -1
+
+                # Children appear in exact without-replacement sampling order
+                for v in range(1, B1):
+                    if (v < n_logits) & (accepted_v < 0):
+                        pv = tl.load(tree_parents_ptr + p_base + v)
+                        cr = tl.load(tree_child_rank_ptr + p_base + v)
+                        if (pv == u) & (cr >= 0):
+                            is_cr = offs_k == cr
+                            q_raw_r = tl.sum(tl.where(is_cr, q_orig, 0.0), axis=0)
+                            p_cur_r = tl.sum(tl.where(is_cr, p_cur, 0.0), axis=0)
+                            if (rem_S > 1e-12) & (q_raw_r > 1e-12):
+                                q_r = q_raw_r / rem_S
+                                alpha = tl.minimum(1.0, p_cur_r / q_r)
+                                eta = murmur3_uniform32(
+                                    seed,
+                                    (pos_u << 8) ^ 0x5A5A,
+                                    tl.cast(v, tl.uint32),
+                                )
+                                if eta < alpha:
+                                    accepted_v = v
+                                    tok_v = tl.load(
+                                        tree_tokens_ptr + t_base + (v - 1)
+                                    )
+                                    tl.store(out_sampled_ptr + r * B1 + step, tok_v)
+                                    step += 1
+                                else:
+                                    q_cur = tl.where(
+                                        k_mask & (~used), q_orig / rem_S, 0.0
+                                    )
+                                    p_new = tl.maximum(0.0, p_cur - q_cur)
+                                    Z = tl.sum(p_new, axis=0) + p_rest
+                                    if Z > 1e-12:
+                                        inv_Z = 1.0 / Z
+                                        p_cur = p_new * inv_Z
+                                        p_rest = p_rest * inv_Z
+                                    else:
+                                        p_cur = p_cand
+                                        p_rest = tl.maximum(
+                                            0.0, 1.0 - tl.sum(p_cand, axis=0)
+                                        )
+                                    used = used | is_cr
+                                    rem_S = tl.maximum(0.0, rem_S - q_raw_r)
+
+                if accepted_v >= 0:
+                    u = accepted_v
+                else:
+                    # All children rejected: exact 2-way mixture sample from residual
+                    m_cand = tl.sum(p_cur, axis=0)
+                    u_mix = murmur3_uniform32(
+                        seed, (pos_u << 8) ^ 0xA5A5, tl.cast(u, tl.uint32)
+                    )
+                    if (m_cand > 1e-12) & ((u_mix < m_cand) | (p_rest <= 1e-12)):
+                        # Sample directly from 16-element residual p_cur in registers!
+                        u_c = murmur3_uniform32(
+                            seed, pos_u, offs_k.to(tl.uint32)
+                        )
+                        g_c = tl.log(tl.maximum(p_cur, 1e-30)) - tl.log(
+                            -tl.log(tl.maximum(u_c, 1e-7))
+                        )
+                        g_c = tl.where(k_mask & (p_cur > 1e-12), g_c, float("-inf"))
+                        best_k = tl.argmax(g_c, axis=0)
+                        bonus = tl.sum(tl.where(offs_k == best_k, c_ids, 0), axis=0)
+                    else:
+                        # Sample from vocab \ C_u (single pass, excluding 16 cands)
+                        bonus = _vocab_gumbel_sample(
+                            row_ptr,
+                            vocab_size,
+                            seed,
+                            pos_u,
+                            cand_u_ptr,
+                            True,
+                            TOP_K,
+                            BLOCK_V,
+                        )
+                    tl.store(out_sampled_ptr + r * B1 + step, bonus)
+                    step += 1
+                    keep_going = False
+
+    tl.store(out_num_sampled_ptr + r, step)
+    tl.store(out_num_rejected_ptr + r, n_logits - step)
+
+
 # ---------------------------------------------------------------------------
 # 5. In-Place Accepted-Path KV Cache & Hidden-State Compaction
 # ---------------------------------------------------------------------------
@@ -776,6 +1241,21 @@ class CRLTreeState:
         self.tree_mask = torch.zeros(
             max_num_reqs, self.b1, self.b1, dtype=torch.uint8, device=device
         )
+        # Persistent stochastic-tree proposal buffers (CUDA-Graph safe, indexed by req_state)
+        self.tree_cand_ids = torch.zeros(
+            max_num_reqs, self.b1, top_k, dtype=torch.int64, device=device
+        )
+        self.tree_cand_probs = torch.zeros(
+            max_num_reqs, self.b1, top_k, dtype=torch.float32, device=device
+        )
+        self.tree_child_rank = torch.full(
+            (max_num_reqs, self.b1), -1, dtype=torch.int32, device=device
+        )
+        self.tree_is_stochastic = torch.zeros(
+            max_num_reqs, dtype=torch.uint8, device=device
+        )
+        self.stochastic_enabled = get_crl_tree_stochastic_verify()
+        self.stoch_alpha_base = get_crl_tree_stoch_alpha_base()
         # Initialize default chain topology so dummy / uninitialized slots are valid lower-triangular
         for i in range(self.b1):
             self.tree_parents[:, i] = i - 1
@@ -845,12 +1325,25 @@ class CRLTreeState:
         null_delta: torch.Tensor | None = None,  # [max_num_reqs, N, K_a]
         null_beta: torch.Tensor | None = None,  # [N]
         out_node_weights: torch.Tensor | None = None,  # [max_num_reqs, B]
+        temperature: torch.Tensor | None = None,  # [max_num_reqs] float32
+        seeds: torch.Tensor | None = None,  # [max_num_reqs] int64
+        sample_positions: torch.Tensor | None = None,  # [num_reqs * N] int64
     ) -> None:
         BLOCK_K = triton.next_power_of_2(self.top_k)
         BLOCK_B1 = triton.next_power_of_2(self.b1)
         has_null = null_delta is not None and null_beta is not None
+        use_stoch = (
+            self.stochastic_enabled
+            and temperature is not None
+            and seeds is not None
+            and sample_positions is not None
+        )
         k_a = int(null_delta.shape[-1]) if has_null else 1
-        w_out = out_node_weights if out_node_weights is not None else self.step_node_weights
+        w_out = (
+            out_node_weights
+            if out_node_weights is not None
+            else self.step_node_weights
+        )
         inv_t = 1.0 if has_null else (1.0 / self.temp)
         _build_crl_tree_kernel[(num_reqs,)](
             scores,
@@ -858,6 +1351,9 @@ class CRLTreeState:
             sample_idx_mapping,
             null_delta if has_null else self._f_w,
             null_beta if has_null else self._f_w,
+            temperature if use_stoch else self._f_w,
+            seeds if use_stoch else self.tree_tokens,
+            sample_positions if use_stoch else self.tree_tokens,
             self._f_w,
             self._f_parent,
             self._f_row,
@@ -869,9 +1365,15 @@ class CRLTreeState:
             self.tree_depths,
             self.tree_mask,
             self.tree_tokens,
+            self.tree_cand_ids,
+            self.tree_cand_probs,
+            self.tree_child_rank,
+            self.tree_is_stochastic,
             inv_t,
+            self.stoch_alpha_base,
             pad_token,
             HAS_NULL=has_null,
+            STOCHASTIC_ENABLED=use_stoch,
             K_A=k_a,
             N_ROWS=self.draft_rows,
             TOP_K=self.top_k,
@@ -943,6 +1445,56 @@ class CRLTreeState:
             BUDGET=self.budget,
             B1=self.b1,
             num_warps=1,
+        )
+        return out_sampled, acc_nodes, out_num_sampled, out_num_rejected
+
+    def verify_trees_stochastic(
+        self,
+        processed_logits: torch.Tensor,  # [total_logits, V]
+        idx_mapping: torch.Tensor,  # [num_reqs] int64
+        cu_num_logits: torch.Tensor,  # [num_reqs + 1] int32
+        positions: torch.Tensor,  # [total_logits] int64
+        seeds: torch.Tensor,  # [max_num_reqs] int64
+        temperature: torch.Tensor,  # [max_num_reqs] float32
+        num_reqs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        out_sampled = torch.full(
+            (num_reqs, self.b1), -1, dtype=torch.int64, device=self.device
+        )
+        out_num_sampled = torch.empty(num_reqs, dtype=torch.int32, device=self.device)
+        out_num_rejected = torch.empty(num_reqs, dtype=torch.int32, device=self.device)
+        acc_nodes = self.step_acc_nodes[:num_reqs]
+        vocab_size = processed_logits.shape[-1]
+        BLOCK_K = triton.next_power_of_2(self.top_k)
+        BLOCK_V = 4096 if vocab_size >= 4096 else triton.next_power_of_2(vocab_size)
+        # Parallelize LSE across all SMs (instead of 1-SM sequential scan per node).
+        row_lse = torch.logsumexp(processed_logits.float(), dim=-1)
+        _tree_verify_stochastic_kernel[(num_reqs,)](
+            processed_logits,
+            row_lse,
+            processed_logits.stride(0),
+            vocab_size,
+            idx_mapping,
+            cu_num_logits,
+            positions,
+            seeds,
+            temperature,
+            self.tree_tokens,
+            self.tree_parents,
+            self.tree_cand_ids,
+            self.tree_cand_probs,
+            self.tree_child_rank,
+            self.tree_is_stochastic,
+            out_sampled,
+            acc_nodes,
+            out_num_sampled,
+            out_num_rejected,
+            BUDGET=self.budget,
+            B1=self.b1,
+            TOP_K=self.top_k,
+            BLOCK_K=BLOCK_K,
+            BLOCK_V=BLOCK_V,
+            num_warps=8,
         )
         return out_sampled, acc_nodes, out_num_sampled, out_num_rejected
 

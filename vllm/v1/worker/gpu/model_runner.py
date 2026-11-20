@@ -1831,6 +1831,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if _all_greedy and not _has_pen:
                 target_tokens = logits.argmax(dim=-1)
+                sampled_token_ids, acc_nodes, num_sampled, num_rejected = (
+                    tree_state.verify_trees(
+                        target_tokens,
+                        input_batch.idx_mapping,
+                        input_batch.cu_num_logits,
+                        input_batch.num_reqs,
+                    )
+                )
+            elif tree_state.stochastic_enabled:
+                processed_logits = self.sampler.apply_sampling_params(
+                    logits,
+                    input_batch.expanded_idx_mapping,
+                    input_batch.idx_mapping,
+                    input_batch.idx_mapping_np,
+                    input_batch.positions[input_batch.logits_indices],
+                    input_batch.input_ids[input_batch.logits_indices],
+                    input_batch.expanded_local_pos,
+                    input_batch.seq_lens_cpu_upper_bound.numpy(),
+                    skip_top_k_top_p=False,
+                )
+                sampled_token_ids, acc_nodes, num_sampled, num_rejected = (
+                    tree_state.verify_trees_stochastic(
+                        processed_logits,
+                        input_batch.idx_mapping,
+                        input_batch.cu_num_logits,
+                        input_batch.positions[input_batch.logits_indices],
+                        _ss.seeds.gpu,
+                        _ss.temperature.gpu,
+                        input_batch.num_reqs,
+                    )
+                )
             else:
                 target_tokens, _ = self.sampler.sample(
                     logits,
@@ -1842,14 +1873,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.expanded_local_pos,
                     input_batch.seq_lens_cpu_upper_bound.numpy(),
                 )
-            sampled_token_ids, acc_nodes, num_sampled, num_rejected = (
-                tree_state.verify_trees(
-                    target_tokens,
-                    input_batch.idx_mapping,
-                    input_batch.cu_num_logits,
-                    input_batch.num_reqs,
+                sampled_token_ids, acc_nodes, num_sampled, num_rejected = (
+                    tree_state.verify_trees(
+                        target_tokens,
+                        input_batch.idx_mapping,
+                        input_batch.cu_num_logits,
+                        input_batch.num_reqs,
+                    )
                 )
-            )
             self._step_acc_nodes = acc_nodes
             sampler_output = SamplerOutput(
                 sampled_token_ids=sampled_token_ids,

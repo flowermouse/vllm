@@ -288,12 +288,12 @@ class CRLSpeculator(DFlash2Speculator):
                 pad_token=self.parallel_drafting_token_id,
                 null_delta=(
                     self._null_delta
-                    if (self._conf_mode == "null" and self._null_delta is not None)
+                    if (self._null_delta is not None and self._null_beta is not None)
                     else None
                 ),
                 null_beta=(
                     self._null_beta
-                    if (self._conf_mode == "null" and self._null_beta is not None)
+                    if (self._null_delta is not None and self._null_beta is not None)
                     else None
                 ),
                 out_node_weights=(
@@ -301,6 +301,9 @@ class CRLSpeculator(DFlash2Speculator):
                     if self.enable_adaptive_verification
                     else None
                 ),
+                temperature=self.temperature,
+                seeds=self.seeds,
+                sample_positions=self.sample_pos,
             )
             return
         kwargs = {}
