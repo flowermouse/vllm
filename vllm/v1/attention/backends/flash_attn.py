@@ -1448,53 +1448,91 @@ class FlashAttentionImpl(AttentionImpl):
                         s_aux=self.sinks,
                     )
                     # 2) Overwrite tree requests with exact Split-Tree FA3 + fused Triton.
+                    # Cache per-step mixed index tensors on attn_metadata so layers 1..35
+                    # avoid repeating the .cpu() sync and index construction.
                     t_reqs = attn_metadata.tree_mixed_req_ids
-                    t_ranges = attn_metadata.tree_mixed_q_ranges
-                    assert t_ranges is not None
                     if t_reqs:
-                        b1 = attn_metadata.tree_b1
-                        idx_t = torch.tensor(t_reqs, dtype=torch.int64, device=q_act.device)
-                        tok_slices = [torch.arange(s, e, device=q_act.device) for s, e in t_ranges]
-                        tok_idx = torch.cat(tok_slices, dim=0)
-                        qt = q_act[tok_idx].contiguous()
-                        kt = k_act[tok_idx].contiguous()
-                        vt = v_act[tok_idx].contiguous()
-                        cu_t = torch.zeros(len(t_reqs) + 1, dtype=torch.int32, device=q_act.device)
-                        pos_acc = 0
-                        for ii, (s, e) in enumerate(t_ranges):
-                            pos_acc += e - s
-                            cu_t[ii + 1] = pos_acc
-                        pref_t = attn_metadata.tree_prefix_lens[idx_t]
-                        bt_t = block_table[idx_t]
-                        mask_t = attn_metadata.tree_mask[idx_t]
-                        out_p_t = torch.empty_like(qt)
-                        out_p_t, lse_p_t = flash_attn_varlen_func(
-                            q=qt,
-                            k=key_cache,
-                            v=value_cache,
-                            out=out_p_t,
-                            cu_seqlens_q=cu_t,
-                            max_seqlen_q=b1,
-                            seqused_k=pref_t,
-                            max_seqlen_k=max(1, attn_metadata.max_tree_prefix_len),
-                            softmax_scale=self.scale,
-                            causal=False,
-                            alibi_slopes=self.alibi_slopes,
-                            window_size=sliding_window_size,
-                            block_table=bt_t,
-                            softcap=self.logits_soft_cap,
-                            return_softmax_lse=True,
-                            fa_version=self.vllm_flash_attn_version,
-                            q_descale=q_descale,
-                            k_descale=k_descale,
-                            v_descale=v_descale,
-                        )
-                        out_tree = torch.empty_like(qt)
-                        fused_intra_tree_and_merge_varlen(
-                            qt, kt, vt, out_p_t, lse_p_t, mask_t, cu_t, pref_t,
-                            out_tree, self.scale, len(t_reqs), b1,
-                        )
-                        out_act[tok_idx] = out_tree
+                        cache = getattr(attn_metadata, "_tree_mixed_cache", None)
+                        if cache is None:
+                            cu_cpu = cu_seqlens_q.cpu().tolist()
+                            t_ranges = [
+                                (cu_cpu[r], cu_cpu[r + 1])
+                                for r in t_reqs
+                                if cu_cpu[r + 1] - cu_cpu[r] > 1
+                            ]
+                            t_reqs_live = [
+                                r for r in t_reqs if cu_cpu[r + 1] - cu_cpu[r] > 1
+                            ]
+                            if t_reqs_live:
+                                max_q_t = max(e - s for s, e in t_ranges)
+                                idx_t = torch.tensor(
+                                    t_reqs_live, dtype=torch.int64, device=q_act.device
+                                )
+                                tok_idx = torch.cat(
+                                    [
+                                        torch.arange(s, e, device=q_act.device)
+                                        for s, e in t_ranges
+                                    ],
+                                    dim=0,
+                                )
+                                cu_vals = [0]
+                                for s, e in t_ranges:
+                                    cu_vals.append(cu_vals[-1] + (e - s))
+                                cu_t = torch.tensor(
+                                    cu_vals, dtype=torch.int32, device=q_act.device
+                                )
+                                cache = (len(t_reqs_live), max_q_t, idx_t, tok_idx, cu_t)
+                            else:
+                                cache = ()
+                            attn_metadata._tree_mixed_cache = cache
+                        if cache:
+                            n_live, max_q_t, idx_t, tok_idx, cu_t = cache
+                            b1 = attn_metadata.tree_b1
+                            qt = q_act[tok_idx].contiguous()
+                            kt = k_act[tok_idx].contiguous()
+                            vt = v_act[tok_idx].contiguous()
+                            pref_t = attn_metadata.tree_prefix_lens[idx_t]
+                            bt_t = block_table[idx_t]
+                            mask_t = attn_metadata.tree_mask[idx_t]
+                            out_p_t = torch.empty_like(qt)
+                            out_p_t, lse_p_t = flash_attn_varlen_func(
+                                q=qt,
+                                k=key_cache,
+                                v=value_cache,
+                                out=out_p_t,
+                                cu_seqlens_q=cu_t,
+                                max_seqlen_q=max_q_t,
+                                seqused_k=pref_t,
+                                max_seqlen_k=max(1, attn_metadata.max_tree_prefix_len),
+                                softmax_scale=self.scale,
+                                causal=False,
+                                alibi_slopes=self.alibi_slopes,
+                                window_size=sliding_window_size,
+                                block_table=bt_t,
+                                softcap=self.logits_soft_cap,
+                                return_softmax_lse=True,
+                                fa_version=self.vllm_flash_attn_version,
+                                q_descale=q_descale,
+                                k_descale=k_descale,
+                                v_descale=v_descale,
+                            )
+                            out_tree = torch.empty_like(qt)
+                            fused_intra_tree_and_merge_varlen(
+                                qt,
+                                kt,
+                                vt,
+                                out_p_t,
+                                lse_p_t,
+                                mask_t,
+                                cu_t,
+                                pref_t,
+                                out_tree,
+                                self.scale,
+                                n_live,
+                                max_q_t,
+                                mask_stride=b1,
+                            )
+                            out_act[tok_idx] = out_tree
                     return output
 
                 out_p = (
@@ -1522,6 +1560,7 @@ class FlashAttentionImpl(AttentionImpl):
                     q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    num_splits=num_splits,
                 )
                 num_reqs_tree = cu_seqlens_q.shape[0] - 1
                 fused_intra_tree_and_merge_varlen(
@@ -1537,6 +1576,7 @@ class FlashAttentionImpl(AttentionImpl):
                     self.scale,
                     num_reqs_tree,
                     max_seqlen_q,
+                    mask_stride=attn_metadata.tree_b1 or max_seqlen_q,
                 )
                 return output
 

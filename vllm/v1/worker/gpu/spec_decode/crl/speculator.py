@@ -286,6 +286,21 @@ class CRLSpeculator(DFlash2Speculator):
                 self.sample_idx_mapping,
                 self.draft_tokens,
                 pad_token=self.parallel_drafting_token_id,
+                null_delta=(
+                    self._null_delta
+                    if (self._conf_mode == "null" and self._null_delta is not None)
+                    else None
+                ),
+                null_beta=(
+                    self._null_beta
+                    if (self._conf_mode == "null" and self._null_beta is not None)
+                    else None
+                ),
+                out_node_weights=(
+                    self.draft_token_confidence_probs
+                    if self.enable_adaptive_verification
+                    else None
+                ),
             )
             return
         kwargs = {}

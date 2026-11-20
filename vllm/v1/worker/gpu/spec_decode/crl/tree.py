@@ -38,6 +38,8 @@ def _build_crl_tree_kernel(
     scores_ptr,  # [num_reqs, N, K, K] float32 (from CRL _score_candidates)
     cand_ids_ptr,  # [num_reqs, N, K] int64
     idx_mapping_ptr,  # [num_reqs * N] int64 (req_state_idx repeated N times)
+    null_delta_ptr,  # [max_num_reqs, N, K_A] float32 (when HAS_NULL=True)
+    null_beta_ptr,  # [N] float32 (when HAS_NULL=True)
     # Scratch buffers per req: [max_num_reqs, MAX_FRONTIER]
     f_w_ptr,  # float32
     f_parent_ptr,  # int32
@@ -45,12 +47,16 @@ def _build_crl_tree_kernel(
     f_rank_ptr,  # int32
     # Outputs indexed by req_state_idx (persistent) AND dense draft_tokens[req, B]
     out_draft_tokens_ptr,  # [max_num_reqs, B] int64 (indexed by req = 0..num_reqs-1)
+    out_node_weights_ptr,  # [max_num_reqs, B] float32 (indexed by req = 0..num_reqs-1)
+    out_node_weights_stride,
     out_parents_ptr,  # [max_num_reqs, B+1] int32 (indexed by req_state)
     out_depths_ptr,  # [max_num_reqs, B+1] int32 (indexed by req_state)
     out_mask_ptr,  # [max_num_reqs, B+1, B+1] uint8 (indexed by req_state)
     out_tree_toks_ptr,  # [max_num_reqs, B] int64 (indexed by req_state)
     inv_temp,
     pad_token,
+    HAS_NULL: tl.constexpr,
+    K_A: tl.constexpr,
     N_ROWS: tl.constexpr,
     TOP_K: tl.constexpr,
     BUDGET: tl.constexpr,
@@ -95,6 +101,12 @@ def _build_crl_tree_kernel(
     e0 = tl.exp(s0 - s0_max)
     e0 = tl.where(k_mask, e0, 0.0)
     p0 = e0 / tl.sum(e0, axis=0)
+    if HAS_NULL:
+        d0 = (
+            tl.load(null_delta_ptr + (req * N_ROWS + 0) * K_A + 0).to(tl.float32)
+            + tl.load(null_beta_ptr + 0).to(tl.float32)
+        )
+        p0 = p0 * (1.0 / (1.0 + tl.exp(d0)))
 
     # Push top MAX_BR children of root (row 0) into frontier slots 0..MAX_BR-1
     f_size = 0
@@ -119,6 +131,10 @@ def _build_crl_tree_kernel(
         if best_w <= 0.0:
             # Degenerate fallback: attach pad_token to root
             tl.store(out_draft_tokens_ptr + req * BUDGET + (node_id - 1), pad_token)
+            tl.store(
+                out_node_weights_ptr + req * out_node_weights_stride + (node_id - 1),
+                0.0,
+            )
             tl.store(out_tree_toks_ptr + req_state * BUDGET + (node_id - 1), pad_token)
             tl.store(out_parents_ptr + p_base + node_id, 0)
             tl.store(out_depths_ptr + p_base + node_id, 1)
@@ -135,6 +151,10 @@ def _build_crl_tree_kernel(
 
             tok = tl.load(cand_ids_ptr + (req * N_ROWS + row) * TOP_K + rank)
             tl.store(out_draft_tokens_ptr + req * BUDGET + (node_id - 1), tok)
+            tl.store(
+                out_node_weights_ptr + req * out_node_weights_stride + (node_id - 1),
+                best_w,
+            )
             tl.store(out_tree_toks_ptr + req_state * BUDGET + (node_id - 1), tok)
             tl.store(out_parents_ptr + p_base + node_id, par_id)
             tl.store(out_depths_ptr + p_base + node_id, row + 1)
@@ -162,6 +182,15 @@ def _build_crl_tree_kernel(
                 en = tl.exp(sn - sn_max)
                 en = tl.where(k_mask, en, 0.0)
                 pn = en / tl.sum(en, axis=0)
+                if HAS_NULL:
+                    if rank < K_A:
+                        dn = (
+                            tl.load(
+                                null_delta_ptr + (req * N_ROWS + next_row) * K_A + rank
+                            ).to(tl.float32)
+                            + tl.load(null_beta_ptr + next_row).to(tl.float32)
+                        )
+                        pn = pn * (1.0 / (1.0 + tl.exp(dn)))
                 rem_pn = pn
                 for _ in range(MAX_BR):
                     br = tl.argmax(rem_pn, axis=0)
@@ -188,7 +217,7 @@ def _fused_intra_tree_and_merge_varlen_kernel(
     v_ptr,  # [T, H_kv, D]
     out_p_ptr,  # [T, H, D] (prefix FA3 output)
     lse_p_ptr,  # [H, T] fp32 (prefix FA3 LSE)
-    mask_ptr,  # [num_reqs, MAX_Q, MAX_Q] uint8
+    mask_ptr,  # [num_reqs, MASK_STRIDE, MASK_STRIDE] uint8
     cu_q_ptr,  # [num_reqs + 1] int32
     prefix_lens_ptr,  # [num_reqs] int32
     out_ptr,  # [T, H, D]
@@ -205,66 +234,89 @@ def _fused_intra_tree_and_merge_varlen_kernel(
     lp_s1,
     o_s0,
     o_s1,
-    MAX_Q: tl.constexpr,
+    MASK_STRIDE: tl.constexpr,
     H: tl.constexpr,
     H_kv: tl.constexpr,
+    G: tl.constexpr,
     D: tl.constexpr,
     BLOCK_Q: tl.constexpr,
 ):
-    bh = tl.program_id(0)
-    qi = tl.program_id(1)
-    b = bh // H
-    h = bh % H
-    h_kv = h // (H // H_kv)
+    b = tl.program_id(0)
+    h_kv = tl.program_id(1)
 
     q_start = tl.load(cu_q_ptr + b)
     q_end = tl.load(cu_q_ptr + b + 1)
     q_len = q_end - q_start
-    if qi >= q_len:
+    if q_len <= 0:
         return
 
+    offs_q = tl.arange(0, BLOCK_Q)
     offs_d = tl.arange(0, D)
-    offs_k = tl.arange(0, BLOCK_Q)
-    k_valid = offs_k < q_len
+    q_valid = offs_q < q_len
+    tok_idx = q_start + offs_q
 
-    tok_q = q_start + qi
-    q = tl.load(q_ptr + tok_q * q_s0 + h * q_s1 + offs_d).to(tl.float32)
-
-    m_row = tl.load(mask_ptr + (b * MAX_Q + qi) * MAX_Q + offs_k, mask=k_valid, other=0)
-    allowed = k_valid & (m_row != 0)
-
-    tok_k = q_start + offs_k
-    k_ptrs = k_ptr + tok_k[:, None] * k_s0 + h_kv * k_s1 + offs_d[None, :]
-    k = tl.load(k_ptrs, mask=allowed[:, None], other=0.0).to(tl.float32)
-
-    scores = tl.sum(k * q[None, :], axis=1) * scale
-    scores = tl.where(allowed, scores, float("-inf"))
-
-    max_s = tl.max(scores, axis=0)
-    exp_s = tl.exp(scores - max_s)
-    sum_e = tl.sum(exp_s, axis=0)
-    lse_t = max_s + tl.log(sum_e)
-    probs = exp_s / sum_e
-
-    v_ptrs = v_ptr + tok_k[:, None] * v_s0 + h_kv * v_s1 + offs_d[None, :]
-    v = tl.load(v_ptrs, mask=allowed[:, None], other=0.0).to(tl.float32)
-    out_t = tl.sum(v * probs[:, None], axis=0)
+    # Load K, V, and tree_mask ONCE per (req, kv_head) and reuse across all G query heads.
+    k = tl.load(
+        k_ptr + tok_idx[:, None] * k_s0 + h_kv * k_s1 + offs_d[None, :],
+        mask=q_valid[:, None],
+        other=0.0,
+    )
+    v = tl.load(
+        v_ptr + tok_idx[:, None] * v_s0 + h_kv * v_s1 + offs_d[None, :],
+        mask=q_valid[:, None],
+        other=0.0,
+    )
+    m_ptrs = (
+        mask_ptr + (b * MASK_STRIDE + offs_q[:, None]) * MASK_STRIDE + offs_q[None, :]
+    )
+    m_2d = tl.load(m_ptrs, mask=q_valid[:, None] & q_valid[None, :], other=0)
+    allowed = q_valid[:, None] & q_valid[None, :] & (m_2d != 0)
 
     pref_len = tl.load(prefix_lens_ptr + b)
-    if pref_len > 0:
-        out_p = tl.load(out_p_ptr + tok_q * op_s0 + h * op_s1 + offs_d).to(tl.float32)
-        lse_p = tl.load(lse_p_ptr + h * lp_s0 + tok_q * lp_s1).to(tl.float32)
-        m = tl.maximum(lse_p, lse_t)
-        ep = tl.exp(lse_p - m)
-        et = tl.exp(lse_t - m)
-        out_merged = (out_p * ep + out_t * et) / (ep + et)
-    else:
-        out_merged = out_t
+    h_base = h_kv * G
 
-    tl.store(
-        out_ptr + tok_q * o_s0 + h * o_s1 + offs_d,
-        out_merged.to(q_ptr.dtype.element_ty),
-    )
+    for g in tl.static_range(G):
+        h = h_base + g
+        q = tl.load(
+            q_ptr + tok_idx[:, None] * q_s0 + h * q_s1 + offs_d[None, :],
+            mask=q_valid[:, None],
+            other=0.0,
+        )
+        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
+        scores = tl.where(allowed, scores, float("-inf"))
+
+        max_s = tl.max(scores, axis=1)
+        exp_s = tl.exp(scores - max_s[:, None])
+        exp_s = tl.where(allowed, exp_s, 0.0)
+        sum_e = tl.sum(exp_s, axis=1)
+        lse_t = max_s + tl.log(sum_e)
+        probs = (exp_s / sum_e[:, None]).to(v.dtype)
+
+        out_t = tl.dot(probs, v, out_dtype=tl.float32)
+
+        if pref_len > 0:
+            out_p = tl.load(
+                out_p_ptr + tok_idx[:, None] * op_s0 + h * op_s1 + offs_d[None, :],
+                mask=q_valid[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            lse_p = tl.load(
+                lse_p_ptr + h * lp_s0 + tok_idx * lp_s1,
+                mask=q_valid,
+                other=float("-inf"),
+            ).to(tl.float32)
+            m = tl.maximum(lse_p, lse_t)
+            ep = tl.exp(lse_p - m)
+            et = tl.exp(lse_t - m)
+            out_m = (out_p * ep[:, None] + out_t * et[:, None]) / (ep + et)[:, None]
+        else:
+            out_m = out_t
+
+        tl.store(
+            out_ptr + tok_idx[:, None] * o_s0 + h * o_s1 + offs_d[None, :],
+            out_m.to(q_ptr.dtype.element_ty),
+            mask=q_valid[:, None],
+        )
 
 
 def fused_intra_tree_and_merge_varlen(
@@ -280,11 +332,13 @@ def fused_intra_tree_and_merge_varlen(
     scale: float,
     num_reqs: int,
     max_q: int,
+    mask_stride: int | None = None,
 ) -> None:
     _, H, D = q.shape
     H_kv = k.shape[1]
-    BLOCK_Q = triton.next_power_of_2(max_q)
-    grid = (num_reqs * H, max_q)
+    ms = mask_stride if mask_stride is not None else tree_mask.shape[1]
+    BLOCK_Q = max(16, triton.next_power_of_2(max_q))
+    grid = (num_reqs, H_kv)
     _fused_intra_tree_and_merge_varlen_kernel[grid](
         q,
         k,
@@ -308,9 +362,10 @@ def fused_intra_tree_and_merge_varlen(
         lse_p.stride(1),
         out.stride(0),
         out.stride(1),
-        MAX_Q=max_q,
+        MASK_STRIDE=ms,
         H=H,
         H_kv=H_kv,
+        G=H // H_kv,
         D=D,
         BLOCK_Q=BLOCK_Q,
         num_warps=4,
@@ -342,6 +397,7 @@ def _prepare_tree_step_kernel(
     tl.store(step_prefix_lens_ptr + r, pref_len)
 
     if tl.load(is_tree_req_ptr + r) == 0:
+        tl.store(step_tree_mask_ptr + r * B1 * B1 + 0, 1)
         return
 
     q_start = tl.load(query_start_loc_ptr + r)
@@ -744,8 +800,14 @@ class CRLTreeState:
         self.step_prefix_lens = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
         )
+        self.step_node_weights = torch.zeros(
+            max_num_reqs, budget, dtype=torch.float32, device=device
+        )
         self.step_is_tree_req = torch.ones(
             max_num_reqs, dtype=torch.uint8, device=device
+        )
+        self._is_tree_req_pinned = torch.ones(
+            max_num_reqs, dtype=torch.uint8, pin_memory=True
         )
         self.step_tree_mask = torch.zeros(
             max_num_reqs, self.b1, self.b1, dtype=torch.uint8, device=device
@@ -780,24 +842,37 @@ class CRLTreeState:
         sample_idx_mapping: torch.Tensor,  # [num_reqs * N]
         out_draft_tokens: torch.Tensor,  # [max_num_reqs, B]
         pad_token: int = 0,
+        null_delta: torch.Tensor | None = None,  # [max_num_reqs, N, K_a]
+        null_beta: torch.Tensor | None = None,  # [N]
+        out_node_weights: torch.Tensor | None = None,  # [max_num_reqs, B]
     ) -> None:
         BLOCK_K = triton.next_power_of_2(self.top_k)
         BLOCK_B1 = triton.next_power_of_2(self.b1)
+        has_null = null_delta is not None and null_beta is not None
+        k_a = int(null_delta.shape[-1]) if has_null else 1
+        w_out = out_node_weights if out_node_weights is not None else self.step_node_weights
+        inv_t = 1.0 if has_null else (1.0 / self.temp)
         _build_crl_tree_kernel[(num_reqs,)](
             scores,
             candidate_ids,
             sample_idx_mapping,
+            null_delta if has_null else self._f_w,
+            null_beta if has_null else self._f_w,
             self._f_w,
             self._f_parent,
             self._f_row,
             self._f_rank,
             out_draft_tokens,
+            w_out,
+            w_out.stride(0),
             self.tree_parents,
             self.tree_depths,
             self.tree_mask,
             self.tree_tokens,
-            1.0 / self.temp,
+            inv_t,
             pad_token,
+            HAS_NULL=has_null,
+            K_A=k_a,
             N_ROWS=self.draft_rows,
             TOP_K=self.top_k,
             BUDGET=self.budget,
@@ -818,8 +893,11 @@ class CRLTreeState:
         is_tree_req_np=None,
     ) -> None:
         if is_tree_req_np is not None:
+            self._is_tree_req_pinned[:num_reqs].copy_(
+                torch.from_numpy(is_tree_req_np)
+            )
             self.step_is_tree_req[:num_reqs].copy_(
-                torch.from_numpy(is_tree_req_np), non_blocking=True
+                self._is_tree_req_pinned[:num_reqs], non_blocking=True
             )
         else:
             self.step_is_tree_req[:num_reqs].fill_(1)

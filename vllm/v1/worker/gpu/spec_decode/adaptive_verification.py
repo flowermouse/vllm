@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adaptive verification for DSpark speculative decoding."""
 
+import os
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
@@ -71,6 +72,7 @@ def _assign_draft_token_budget_kernel(
     num_reqs,
     draft_budget,
     HAS_GPU_D: tl.constexpr,
+    IS_TREE_WEIGHTS: tl.constexpr,
     NUM_STEPS: tl.constexpr,
     BLOCK_REQS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -102,7 +104,12 @@ def _assign_draft_token_budget_kernel(
             prob = tl.where(prob == prob, prob, 1.0)
             if HAS_GPU_D:
                 prob = tl.where(step < gpu_d, prob, 0.0)
-            survival = tl.where(eligible, survival * prob, survival)
+            if IS_TREE_WEIGHTS:
+                # CRL tree node weights are already exact descending path survival
+                # probabilities w(1) >= w(2) >= ... >= w(B).
+                survival = tl.where(eligible, prob, survival)
+            else:
+                survival = tl.where(eligible, survival * prob, survival)
             bits = tl.where(eligible, survival.to(tl.int32, bitcast=True), -1)
             tl.store(survival_ptr + reqs * NUM_STEPS + step, bits, mask=mask)
     tl.debug_barrier()
@@ -147,6 +154,7 @@ def assign_draft_token_budget(
     draft_budget: int,
     survival: torch.Tensor,
     gpu_d: torch.Tensor | None = None,
+    is_tree_weights: bool = False,
 ) -> None:
     """Admit the globally best `draft_budget` draft slots, in place.
 
@@ -171,6 +179,7 @@ def assign_draft_token_budget(
         idx_mapping.shape[0],
         draft_budget,
         HAS_GPU_D=gpu_d is not None,
+        IS_TREE_WEIGHTS=is_tree_weights,
         NUM_STEPS=num_steps,
         BLOCK_REQS=256,
         BLOCK_SIZE=1024,
@@ -253,6 +262,16 @@ class AdaptiveVerificationManager:
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
+        from vllm.v1.worker.gpu.spec_decode.crl.tree import get_crl_tree_budget
+
+        self._is_tree_weights = get_crl_tree_budget() > 0
+        self._ctx_aware = self._is_tree_weights or (
+            os.environ.get("VLLM_ADAPTIVE_VERIFICATION_CTX_AWARE", "0") == "1"
+        )
+        self._ctx_lo = 256
+        self._ctx_hi = envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN
+        self._num_base_profile_samples = 0
+        self._beta_kv_ms_per_tok = 0.0
         device = req_states.device
         self._copy_stream = torch.cuda.Stream(device)
 
@@ -332,7 +351,12 @@ class AdaptiveVerificationManager:
         capacities = self._batch_draft_capacity[:1].fill_(self.num_speculative_steps)
         idx_mapping = torch.zeros(1, dtype=torch.int64, device=capacities.device)
         assign_draft_token_budget(
-            self._confidence_probs, idx_mapping, capacities, 1, self._draft_survival
+            self._confidence_probs,
+            idx_mapping,
+            capacities,
+            1,
+            self._draft_survival,
+            is_tree_weights=self._is_tree_weights,
         )
 
     def add_request(self, req_idx: int) -> None:
@@ -357,11 +381,23 @@ class AdaptiveVerificationManager:
                 size = min(size * 2, max_num_tokens)
                 tail_sizes.add(size)
             tail_sizes -= set(capture_sizes)
-        for num_tokens in capture_sizes + sorted(tail_sizes):
+        all_sizes = capture_sizes + sorted(tail_sizes)
+        prof_ctx = self._ctx_lo if self._ctx_aware else self._ctx_hi
+        self._num_base_profile_samples = len(all_sizes) * _PROFILE_REPLAYS
+        for num_tokens in all_sizes:
             for _ in range(_PROFILE_REPLAYS):
                 yield {
                     "num_tokens": num_tokens,
-                    "context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+                    "context_len": prof_ctx,
+                }
+        if self._ctx_aware and self._ctx_hi > self._ctx_lo and capture_sizes:
+            # 5 extra replays at ctx_hi to auto-calibrate KV-read slope beta_kv (ms / ctx_tok).
+            ref_candidates = [s for s in capture_sizes if s <= 256]
+            ref_n = ref_candidates[-1] if ref_candidates else capture_sizes[-1]
+            for _ in range(_PROFILE_REPLAYS):
+                yield {
+                    "num_tokens": ref_n,
+                    "context_len": self._ctx_hi,
                 }
 
     def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
@@ -373,17 +409,48 @@ class AdaptiveVerificationManager:
                 grouped[key].append(value)
             return [(k, float(np.median(v))) for k, v in sorted(grouped.items())]
 
+        base_samples = (
+            samples[: self._num_base_profile_samples]
+            if self._ctx_aware and self._num_base_profile_samples > 0
+            else samples
+        )
+        hi_samples = (
+            samples[self._num_base_profile_samples :]
+            if self._ctx_aware and self._num_base_profile_samples > 0
+            else []
+        )
+
         # Draft curve: eager-target steps inflate drafter timings (the CPU is
         # still launching kernels, opening gaps between the drafter's events),
         # and request counts — unlike token counts — collide across execution
         # modes, so only graph-replay samples may price the draft curve.
         draft_curve = median_curve(
-            (s.num_reqs, s.drafter_ms) for s in samples if s.full_cudagraph
+            (s.num_reqs, s.drafter_ms) for s in base_samples if s.full_cudagraph
         )
         verify_curve = median_curve(
-            (s.num_target_tokens, s.forward_ms) for s in samples
+            (s.num_target_tokens, s.forward_ms) for s in base_samples
         )
         self.set_cost_curves(draft_curve, verify_curve)
+
+        if hi_samples and self.cost_tables is not None:
+            t_hi = float(np.median([s.forward_ms for s in hi_samples]))
+            r_ref = max(1, hi_samples[0].num_reqs)
+            n_ref = hi_samples[0].num_target_tokens
+            t_lo = float(self.cost_tables[1][min(n_ref, len(self.cost_tables[1]) - 1)])
+            self._beta_kv_ms_per_tok = max(
+                0.0, (t_hi - t_lo) / (r_ref * (self._ctx_hi - self._ctx_lo))
+            )
+            logger.info(
+                "Adaptive verification 2D context cost model: ctx_lo=%d -> ctx_hi=%d "
+                "(R=%d, N=%d, %.3f -> %.3f ms), beta_kv=%.6f ms/ctx_tok",
+                self._ctx_lo,
+                self._ctx_hi,
+                r_ref,
+                n_ref,
+                t_lo,
+                t_hi,
+                self._beta_kv_ms_per_tok,
+            )
 
     def set_cost_curves(
         self,
@@ -487,7 +554,12 @@ class AdaptiveVerificationManager:
 
         scheduled_drafts, verify_mode = cap_scheduled(slots, scheduled_drafts)
         stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
-        survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+        if self._is_tree_weights:
+            survival_probability = stale_confidences.astype(np.float64)
+        else:
+            survival_probability = np.cumprod(
+                stale_confidences.astype(np.float64), axis=1
+            )
         steps = np.arange(self.num_speculative_steps)
         valid = steps[None, :] < scheduled_drafts[:, None]
         scores = np.sort(survival_probability[valid])[::-1]
@@ -505,8 +577,15 @@ class AdaptiveVerificationManager:
         num_tokens_to_estimated_accepted_tokens = np.concatenate(
             ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
         )
+        kv_extra_ms = 0.0
+        if self._ctx_aware and self._beta_kv_ms_per_tok > 0.0:
+            total_ctx = float(self.req_states.num_computed_tokens_np[slots].sum())
+            kv_extra_ms = self._beta_kv_ms_per_tok * max(
+                0.0, total_ctx - num_reqs * self._ctx_lo
+            )
         costs = (
             draft_cost_ms[len(req_ids)]
+            + kv_extra_ms
             + verify_cost_ms[
                 num_non_draft_tokens_total : num_non_draft_tokens_total
                 + max_draft_budget
@@ -636,6 +715,7 @@ class AdaptiveVerificationManager:
                     draft_budget,
                     self._draft_survival,
                     gpu_d=self._gpu_draft_depths,
+                    is_tree_weights=self._is_tree_weights,
                 )
 
         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]

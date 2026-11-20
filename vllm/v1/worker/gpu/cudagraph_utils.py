@@ -756,7 +756,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 and desc.cg_mode == CUDAGraphMode.FULL
                 and attn_metadata is not None
                 and num_reqs <= tree_state.max_num_reqs
-                and (desc.max_query_len or desc.uniform_token_count) == tree_state.b1
+                and 1 < (desc.max_query_len or desc.uniform_token_count or 0) <= tree_state.b1
             ):
                 tree_state.step_prefix_lens[:num_reqs].fill_(1)
                 max_pref = self.vllm_config.model_config.max_model_len
@@ -765,6 +765,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                         m.tree_mask = tree_state.step_tree_mask[:num_reqs]
                         m.tree_prefix_lens = tree_state.step_prefix_lens[:num_reqs]
                         m.max_tree_prefix_len = max_pref
+                        m.tree_b1 = tree_state.b1
 
             # Capture with dummy rows marked as padding.
             input_buffers.is_padding.fill_(True)

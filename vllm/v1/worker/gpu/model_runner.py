@@ -1590,7 +1590,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 :num_tokens_after_padding
             ].clone()
             assert num_draft_tokens_per_req is not None
-            is_tree_req_np = (num_draft_tokens_per_req > 0).astype(np.uint8)
+            has_prefill = bool(batch_req_state.has_prefill)
+            is_tree_req_np = (
+                (num_draft_tokens_per_req > 0).astype(np.uint8)
+                if has_prefill
+                else None
+            )
             tree_state.prepare_step(
                 idx_mapping,
                 query_start_loc,
@@ -1600,10 +1605,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_tree_req_np=is_tree_req_np,
             )
             self._active_tree_step = True
-            self._active_tree_mixed = bool(
-                batch_req_state.has_prefill or not bool(is_tree_req_np.all())
-            )
+            # Decode requests with 0 drafts (q_len=1) are handled natively by Split-Tree
+            # (step_prefix_lens=pref_len, mask[0,0]=1), so only genuine prefill steps
+            # need the mixed eager path.
+            self._active_tree_mixed = has_prefill
             if self._active_tree_mixed:
+                assert is_tree_req_np is not None
                 self._active_tree_mixed_ids = [
                     int(i) for i in range(num_reqs) if is_tree_req_np[i]
                 ]
@@ -2158,7 +2165,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if self._active_tree_step or is_dummy_tree_cap:
                     nrp = input_batch.num_reqs_after_padding
                     if is_dummy_tree_cap:
-                        tree_state.step_prefix_lens[:nrp].fill_(1)
+                        # Preserve real context_len during adaptive_verification profiling
+                        # (dummy_run with context_len=8192) instead of forcing prefix=1.
+                        tree_state.step_prefix_lens[:nrp].copy_(
+                            torch.clamp(
+                                input_batch.seq_lens[:nrp] - 1, min=1
+                            ).to(torch.int32)
+                        )
                         max_pref = self.max_model_len
                     else:
                         max_pref = (
@@ -2174,13 +2187,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             m.tree_mask = tree_state.step_tree_mask[:nrp]
                             m.tree_prefix_lens = tree_state.step_prefix_lens[:nrp]
                             m.max_tree_prefix_len = max_pref
+                            m.tree_b1 = tree_state.b1
                             if (
                                 not is_dummy_tree_cap
                                 and getattr(self, "_active_tree_mixed", False)
                             ):
                                 m.tree_mixed_req_ids = self._active_tree_mixed_ids
                                 m.tree_mixed_q_ranges = self._active_tree_mixed_ranges
-                                m.tree_b1 = tree_state.b1
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
