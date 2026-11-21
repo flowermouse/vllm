@@ -1840,12 +1840,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                 )
             elif tree_state.stochastic_enabled:
+                logits_positions = input_batch.positions[input_batch.logits_indices]
                 processed_logits = self.sampler.apply_sampling_params(
                     logits,
                     input_batch.expanded_idx_mapping,
                     input_batch.idx_mapping,
                     input_batch.idx_mapping_np,
-                    input_batch.positions[input_batch.logits_indices],
+                    logits_positions,
                     input_batch.input_ids[input_batch.logits_indices],
                     input_batch.expanded_local_pos,
                     input_batch.seq_lens_cpu_upper_bound.numpy(),
@@ -1856,7 +1857,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         processed_logits,
                         input_batch.idx_mapping,
                         input_batch.cu_num_logits,
-                        input_batch.positions[input_batch.logits_indices],
+                        logits_positions,
                         _ss.seeds.gpu,
                         _ss.temperature.gpu,
                         input_batch.num_reqs,

@@ -715,6 +715,160 @@ def _vocab_gumbel_sample(
 
 
 @triton.jit
+def _fused_row_lse_split_kernel(
+    logits_ptr,
+    logits_stride,
+    vocab_size,
+    split_size,
+    part_max_ptr,  # [total_logits, NUM_SPLITS] float32
+    part_sum_ptr,  # [total_logits, NUM_SPLITS] float32
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0)
+    sid = tl.program_id(1)
+    v_start = sid * split_size
+    v_end = tl.minimum(v_start + split_size, vocab_size)
+    row_ptr = logits_ptr + tl.cast(row, tl.int64) * logits_stride
+
+    max_val = float("-inf")
+    sum_exp = 0.0
+    n_elems = tl.maximum(0, v_end - v_start)
+    num_iters = (n_elems + BLOCK_V - 1) // BLOCK_V
+    for it in range(num_iters):
+        start = v_start + it * BLOCK_V
+        offs = start + tl.arange(0, BLOCK_V)
+        mask = offs < v_end
+        vals = tl.load(row_ptr + offs, mask=mask, other=float("-inf")).to(tl.float32)
+        blk_max = tl.max(vals, axis=0)
+        new_max = tl.maximum(max_val, blk_max)
+        scale_old = tl.where(max_val > float("-inf"), tl.exp(max_val - new_max), 0.0)
+        blk_sum = tl.sum(
+            tl.where(mask & (vals > float("-inf")), tl.exp(vals - new_max), 0.0),
+            axis=0,
+        )
+        sum_exp = sum_exp * scale_old + blk_sum
+        max_val = new_max
+
+    out_idx = row * NUM_SPLITS + sid
+    tl.store(part_max_ptr + out_idx, max_val)
+    tl.store(part_sum_ptr + out_idx, sum_exp)
+
+
+@triton.jit
+def _reduce_row_lse_kernel(
+    part_max_ptr,  # [total_logits, NUM_SPLITS] float32
+    part_sum_ptr,  # [total_logits, NUM_SPLITS] float32
+    row_lse_ptr,  # [total_logits] float32
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_S)
+    mask = offs < NUM_SPLITS
+    base = row * NUM_SPLITS
+    pmax = tl.load(part_max_ptr + base + offs, mask=mask, other=float("-inf"))
+    psum = tl.load(part_sum_ptr + base + offs, mask=mask, other=0.0)
+    gmax = tl.max(pmax, axis=0)
+    scaled = tl.where(mask & (pmax > float("-inf")), psum * tl.exp(pmax - gmax), 0.0)
+    gsum = tl.sum(scaled, axis=0)
+    lse = gmax + tl.log(tl.maximum(gsum, 1e-30))
+    tl.store(row_lse_ptr + row, lse)
+
+
+@triton.jit
+def _parallel_vocab_bonus_split_kernel(
+    logits_ptr,
+    logits_stride,
+    vocab_size,
+    split_size,
+    idx_mapping_ptr,  # [num_reqs] int64
+    positions_ptr,  # [total_logits] int64
+    seeds_ptr,  # [max_num_reqs] int64
+    tree_cand_ids_ptr,  # [max_num_reqs, B+1, K] int64
+    stop_row_ptr,  # [num_reqs] int32
+    stop_u_ptr,  # [num_reqs] int32
+    stop_mode_ptr,  # [num_reqs] int32 (0=done, 1=full gumbel, 2=excl-cands gumbel, 3=argmax)
+    part_val_ptr,  # [num_reqs, BONUS_SPLITS] float32
+    part_idx_ptr,  # [num_reqs, BONUS_SPLITS] int64
+    B1: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BONUS_SPLITS: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    r = tl.program_id(0)
+    mode = tl.load(stop_mode_ptr + r)
+    if mode == 0:
+        return
+
+    sid = tl.program_id(1)
+    row = tl.load(stop_row_ptr + r)
+    req_state = tl.load(idx_mapping_ptr + r)
+    seed = tl.load(seeds_ptr + req_state).to(tl.int64)
+    pos_u = tl.load(positions_ptr + row).to(tl.int64)
+    stop_u = tl.load(stop_u_ptr + r)
+
+    v_start = sid * split_size
+    v_end = tl.minimum(v_start + split_size, vocab_size)
+    row_ptr = logits_ptr + tl.cast(row, tl.int64) * logits_stride
+    cand_u_ptr = tree_cand_ids_ptr + (req_state * B1 + stop_u) * TOP_K
+
+    best_val = float("-inf")
+    best_idx = tl.cast(0, tl.int64)
+    n_elems = tl.maximum(0, v_end - v_start)
+    num_iters = (n_elems + BLOCK_V - 1) // BLOCK_V
+    for it in range(num_iters):
+        start = v_start + it * BLOCK_V
+        offs = start + tl.arange(0, BLOCK_V)
+        mask = offs < v_end
+        vals = tl.load(row_ptr + offs, mask=mask, other=float("-inf")).to(tl.float32)
+        if mode == 2:
+            for k in tl.static_range(TOP_K):
+                ck = tl.load(cand_u_ptr + k)
+                vals = tl.where(offs == ck, float("-inf"), vals)
+        if mode == 3:
+            scores = tl.where(mask, vals, float("-inf"))
+        else:
+            u = murmur3_uniform32(seed, pos_u, offs.to(tl.uint32))
+            scores = vals - tl.log(-tl.log(tl.maximum(u, 1e-7)))
+            scores = tl.where(mask & (vals > float("-inf")), scores, float("-inf"))
+        blk_max = tl.max(scores, axis=0)
+        blk_arg = tl.argmax(scores, axis=0).to(tl.int64) + start
+        if blk_max > best_val:
+            best_val = blk_max
+            best_idx = blk_arg
+
+    out_idx = r * BONUS_SPLITS + sid
+    tl.store(part_val_ptr + out_idx, best_val)
+    tl.store(part_idx_ptr + out_idx, best_idx)
+
+
+@triton.jit
+def _reduce_vocab_bonus_kernel(
+    stop_mode_ptr,  # [num_reqs] int32
+    stop_step_ptr,  # [num_reqs] int32
+    part_val_ptr,  # [num_reqs, BONUS_SPLITS] float32
+    part_idx_ptr,  # [num_reqs, BONUS_SPLITS] int64
+    out_sampled_ptr,  # [num_reqs, B+1] int64
+    B1: tl.constexpr,
+    BONUS_SPLITS: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    r = tl.program_id(0)
+    if tl.load(stop_mode_ptr + r) == 0:
+        return
+    offs = tl.arange(0, BLOCK_S)
+    mask = offs < BONUS_SPLITS
+    base = r * BONUS_SPLITS
+    vals = tl.load(part_val_ptr + base + offs, mask=mask, other=float("-inf"))
+    idxs = tl.load(part_idx_ptr + base + offs, mask=mask, other=0)
+    best_s = tl.argmax(vals, axis=0)
+    best_tok = tl.sum(tl.where(offs == best_s, idxs, 0), axis=0)
+    step = tl.load(stop_step_ptr + r)
+    tl.store(out_sampled_ptr + r * B1 + step, best_tok)
+
+
+@triton.jit
 def _tree_verify_stochastic_kernel(
     logits_ptr,  # [total_logits, V] (already processed by apply_sampling_params)
     row_lse_ptr,  # [total_logits] float32 (precomputed in parallel across all SMs!)
@@ -735,6 +889,10 @@ def _tree_verify_stochastic_kernel(
     out_acc_nodes_ptr,  # [num_reqs, B+1] int32
     out_num_sampled_ptr,  # [num_reqs] int32
     out_num_rejected_ptr,  # [num_reqs] int32
+    stop_row_ptr,  # [num_reqs] int32
+    stop_step_ptr,  # [num_reqs] int32
+    stop_u_ptr,  # [num_reqs] int32
+    stop_mode_ptr,  # [num_reqs] int32 (0=done, 1=full gumbel, 2=excl-cands gumbel, 3=argmax)
     BUDGET: tl.constexpr,
     B1: tl.constexpr,
     TOP_K: tl.constexpr,
@@ -747,6 +905,7 @@ def _tree_verify_stochastic_kernel(
     l_end = tl.load(cu_num_logits_ptr + r + 1)
     n_logits = l_end - l_start
 
+    tl.store(stop_mode_ptr + r, 0)
     for j in range(B1):
         tl.store(out_sampled_ptr + r * B1 + j, -1)
         tl.store(out_acc_nodes_ptr + r * B1 + j, 0)
@@ -763,20 +922,15 @@ def _tree_verify_stochastic_kernel(
     t_base = req_state * BUDGET
     c_base = req_state * B1 * TOP_K
 
-    # Single-logit (prefill-only) request
+    # Single-logit (prefill-only) request: offload to parallel vocab bonus kernel
     if n_logits == 1:
-        row_ptr = logits_ptr + tl.cast(l_start, tl.int64) * logits_stride
-        if temp == 0.0:
-            tok = _vocab_argmax(row_ptr, vocab_size, BLOCK_V)
-        else:
-            pos0 = tl.load(positions_ptr + l_start).to(tl.int64)
-            tok = _vocab_gumbel_sample(
-                row_ptr, vocab_size, seed, pos0, tree_cand_ids_ptr, False, TOP_K, BLOCK_V
-            )
-        tl.store(out_sampled_ptr + r * B1 + 0, tok)
         tl.store(out_acc_nodes_ptr + r * B1 + 0, 0)
         tl.store(out_num_sampled_ptr + r, 1)
         tl.store(out_num_rejected_ptr + r, 0)
+        tl.store(stop_row_ptr + r, l_start)
+        tl.store(stop_step_ptr + r, 0)
+        tl.store(stop_u_ptr + r, 0)
+        tl.store(stop_mode_ptr + r, 3 if temp == 0.0 else 1)
         return
 
     # Greedy request inside a mixed batch (or deterministic tree fallback)
@@ -843,18 +997,11 @@ def _tree_verify_stochastic_kernel(
                         has_child = True
 
             if not has_child:
-                # Leaf node: sample 1 bonus token directly from p_u
-                bonus = _vocab_gumbel_sample(
-                    row_ptr,
-                    vocab_size,
-                    seed,
-                    pos_u,
-                    tree_cand_ids_ptr,
-                    False,
-                    TOP_K,
-                    BLOCK_V,
-                )
-                tl.store(out_sampled_ptr + r * B1 + step, bonus)
+                # Leaf node: offload full-vocab bonus sample to parallel kernel
+                tl.store(stop_row_ptr + r, l_start + u)
+                tl.store(stop_step_ptr + r, step)
+                tl.store(stop_u_ptr + r, u)
+                tl.store(stop_mode_ptr + r, 1)
                 step += 1
                 keep_going = False
             else:
@@ -943,19 +1090,13 @@ def _tree_verify_stochastic_kernel(
                         g_c = tl.where(k_mask & (p_cur > 1e-12), g_c, float("-inf"))
                         best_k = tl.argmax(g_c, axis=0)
                         bonus = tl.sum(tl.where(offs_k == best_k, c_ids, 0), axis=0)
+                        tl.store(out_sampled_ptr + r * B1 + step, bonus)
                     else:
-                        # Sample from vocab \ C_u (single pass, excluding 16 cands)
-                        bonus = _vocab_gumbel_sample(
-                            row_ptr,
-                            vocab_size,
-                            seed,
-                            pos_u,
-                            cand_u_ptr,
-                            True,
-                            TOP_K,
-                            BLOCK_V,
-                        )
-                    tl.store(out_sampled_ptr + r * B1 + step, bonus)
+                        # Offload vocab \ C_u residual sample to parallel bonus kernel
+                        tl.store(stop_row_ptr + r, l_start + u)
+                        tl.store(stop_step_ptr + r, step)
+                        tl.store(stop_u_ptr + r, u)
+                        tl.store(stop_mode_ptr + r, 2)
                     step += 1
                     keep_going = False
 
@@ -1299,6 +1440,21 @@ class CRLTreeState:
         self.step_acc_nodes = torch.zeros(
             max_num_reqs, self.b1, dtype=torch.int32, device=device
         )
+        # Persistent scratch buffers for all-SM fused stochastic verification
+        self._stop_row = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        self._stop_step = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        self._stop_u = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        self._stop_mode = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        self._bonus_part_val = torch.empty(
+            max_num_reqs, 32, dtype=torch.float32, device=device
+        )
+        self._bonus_part_idx = torch.empty(
+            max_num_reqs, 32, dtype=torch.int64, device=device
+        )
+        self._lse_buf_cap = 0
+        self._row_lse: torch.Tensor | None = None
+        self._lse_part_max: torch.Tensor | None = None
+        self._lse_part_sum: torch.Tensor | None = None
         # Pre-allocated prefix attention output buffer (lazy-sized on first use)
         self._prefix_out_buf: torch.Tensor | None = None
         # Cached device pointer table for single-launch batched 36-layer KV compaction
@@ -1458,17 +1614,69 @@ class CRLTreeState:
         temperature: torch.Tensor,  # [max_num_reqs] float32
         num_reqs: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        out_sampled = torch.full(
-            (num_reqs, self.b1), -1, dtype=torch.int64, device=self.device
+        out_sampled = torch.empty(
+            (num_reqs, self.b1), dtype=torch.int64, device=self.device
         )
         out_num_sampled = torch.empty(num_reqs, dtype=torch.int32, device=self.device)
         out_num_rejected = torch.empty(num_reqs, dtype=torch.int32, device=self.device)
         acc_nodes = self.step_acc_nodes[:num_reqs]
-        vocab_size = processed_logits.shape[-1]
+        total_logits, vocab_size = processed_logits.shape
         BLOCK_K = triton.next_power_of_2(self.top_k)
-        BLOCK_V = 4096 if vocab_size >= 4096 else triton.next_power_of_2(vocab_size)
-        # Parallelize LSE across all SMs (instead of 1-SM sequential scan per node).
-        row_lse = torch.logsumexp(processed_logits.float(), dim=-1)
+        BLOCK_V = (
+            2048
+            if vocab_size >= 2048
+            else max(16, triton.next_power_of_2(vocab_size))
+        )
+        max_splits = max(1, triton.cdiv(vocab_size, BLOCK_V))
+
+        # 1) Zero-copy fused split-V online LSE directly on bf16/fp32 logits across all SMs
+        if total_logits <= 8:
+            target_lse_splits = 32
+        elif total_logits <= 32:
+            target_lse_splits = 8
+        elif total_logits <= 128:
+            target_lse_splits = 4
+        else:
+            target_lse_splits = 2
+        lse_splits = min(target_lse_splits, max_splits)
+        if total_logits > self._lse_buf_cap:
+            cap = max(total_logits, 256)
+            self._row_lse = torch.empty(cap, dtype=torch.float32, device=self.device)
+            self._lse_part_max = torch.empty(
+                (cap, 32), dtype=torch.float32, device=self.device
+            )
+            self._lse_part_sum = torch.empty(
+                (cap, 32), dtype=torch.float32, device=self.device
+            )
+            self._lse_buf_cap = cap
+        row_lse = self._row_lse[:total_logits]
+        # Use flat 1D views sized (total_logits * lse_splits) with zero allocation
+        part_max = self._lse_part_max.view(-1)[: total_logits * lse_splits]
+        part_sum = self._lse_part_sum.view(-1)[: total_logits * lse_splits]
+
+        lse_split_size = triton.cdiv(vocab_size, lse_splits)
+        lse_split_size = triton.cdiv(lse_split_size, BLOCK_V) * BLOCK_V
+        _fused_row_lse_split_kernel[(total_logits, lse_splits)](
+            processed_logits,
+            processed_logits.stride(0),
+            vocab_size,
+            lse_split_size,
+            part_max,
+            part_sum,
+            NUM_SPLITS=lse_splits,
+            BLOCK_V=BLOCK_V,
+            num_warps=8,
+        )
+        _reduce_row_lse_kernel[(total_logits,)](
+            part_max,
+            part_sum,
+            row_lse,
+            NUM_SPLITS=lse_splits,
+            BLOCK_S=max(16, triton.next_power_of_2(lse_splits)),
+            num_warps=1,
+        )
+
+        # 2) Register-only sparse recursive residual tree walk (no full-vocab scan!)
         _tree_verify_stochastic_kernel[(num_reqs,)](
             processed_logits,
             row_lse,
@@ -1489,12 +1697,54 @@ class CRLTreeState:
             acc_nodes,
             out_num_sampled,
             out_num_rejected,
+            self._stop_row,
+            self._stop_step,
+            self._stop_u,
+            self._stop_mode,
             BUDGET=self.budget,
             B1=self.b1,
             TOP_K=self.top_k,
             BLOCK_K=BLOCK_K,
             BLOCK_V=BLOCK_V,
+            num_warps=2,
+        )
+
+        # 3) All-SM parallel vocab bonus sample for leaf / p_rest / prefill stopping nodes
+        bonus_splits = min(32, max_splits)
+        bonus_split_size = triton.cdiv(vocab_size, bonus_splits)
+        bonus_split_size = triton.cdiv(bonus_split_size, BLOCK_V) * BLOCK_V
+        b_part_val = self._bonus_part_val.view(-1)[: num_reqs * bonus_splits]
+        b_part_idx = self._bonus_part_idx.view(-1)[: num_reqs * bonus_splits]
+        _parallel_vocab_bonus_split_kernel[(num_reqs, bonus_splits)](
+            processed_logits,
+            processed_logits.stride(0),
+            vocab_size,
+            bonus_split_size,
+            idx_mapping,
+            positions,
+            seeds,
+            self.tree_cand_ids,
+            self._stop_row,
+            self._stop_u,
+            self._stop_mode,
+            b_part_val,
+            b_part_idx,
+            B1=self.b1,
+            TOP_K=self.top_k,
+            BONUS_SPLITS=bonus_splits,
+            BLOCK_V=BLOCK_V,
             num_warps=8,
+        )
+        _reduce_vocab_bonus_kernel[(num_reqs,)](
+            self._stop_mode,
+            self._stop_step,
+            b_part_val,
+            b_part_idx,
+            out_sampled,
+            B1=self.b1,
+            BONUS_SPLITS=bonus_splits,
+            BLOCK_S=max(16, triton.next_power_of_2(bonus_splits)),
+            num_warps=1,
         )
         return out_sampled, acc_nodes, out_num_sampled, out_num_rejected
 
