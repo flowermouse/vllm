@@ -703,11 +703,19 @@ class AdaptiveVerificationManager:
         # capacities enters holding each request's valid draft count (the kernel
         # uses it to bound eligible slots) and leaves holding the admitted count.
         capacities = self._batch_draft_capacity[:num_reqs]
+        total_scheduled_drafts = int(scheduled_drafts.sum())
+        num_ver_reqs = int(np.count_nonzero(scheduled_drafts))
+        single_ver_fast_path = (num_ver_reqs <= 1) and (draft_budget > 0)
         if draft_budget == 0:
             capacities.zero_()
+        elif single_ver_fast_path:
+            # With <= 1 verification request, the admitted draft count is already
+            # exact on CPU (draft_budget): skip the GPU ranking kernel and D2H sync.
+            admitted_np = np.minimum(scheduled_drafts, draft_budget)
+            async_tensor_h2d(admitted_np, out=capacities)
         else:
             async_tensor_h2d(scheduled_drafts, out=capacities)
-            if draft_budget < int(scheduled_drafts.sum()):
+            if draft_budget < total_scheduled_drafts:
                 assign_draft_token_budget(
                     self._confidence_probs,
                     idx_mapping,
@@ -735,8 +743,10 @@ class AdaptiveVerificationManager:
         self.query_start_loc[num_reqs + 1 :].fill_(num_tokens)
 
         admitted_drafts = None
-        if self._copy_admitted_drafts_to_host and (
-            0 < draft_budget < int(scheduled_drafts.sum())
+        if (
+            self._copy_admitted_drafts_to_host
+            and (not single_ver_fast_path)
+            and (0 < draft_budget < total_scheduled_drafts)
         ):
             admitted_cpu = self._admitted_drafts_cpu[:num_reqs]
             current_stream = torch.cuda.current_stream(self.req_states.device)
