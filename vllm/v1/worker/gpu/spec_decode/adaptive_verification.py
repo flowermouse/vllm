@@ -3,6 +3,7 @@
 """Adaptive verification for DSpark speculative decoding."""
 
 import os
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
@@ -272,6 +273,14 @@ class AdaptiveVerificationManager:
         self._ctx_hi = envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN
         self._num_base_profile_samples = 0
         self._beta_kv_ms_per_tok = 0.0
+        self._cost_tables_lo: tuple[np.ndarray, np.ndarray] | None = None
+        self._cost_tables_hi: tuple[np.ndarray, np.ndarray] | None = None
+        # Online residual step-overhead tracker (captures unprofiled compute_logits,
+        # rejection/tree verify, KV compaction, and V1 piecewise dispatch gap).
+        self._ema_overhead_ms = 0.0
+        self._prev_step_ts: float | None = None
+        self._prev_modeled_ms: float | None = None
+        self._prev_pure_decode_reqs: int = 0
         device = req_states.device
         self._copy_stream = torch.cuda.Stream(device)
 
@@ -326,8 +335,15 @@ class AdaptiveVerificationManager:
         self._stale_idx = 0
         # Budget statistics (host counters, read through Worker.adaptive_verification_stats)
         self._stats = self._new_stats()
+        # For Unified-Tree (B_max=31), an unobserved request's initial prior must
+        # only populate the first 15 chain-equivalent slots rather than claiming
+        # 31 guaranteed hits and starving established requests in the auction.
+        self._init_conf_np = np.ones(self.num_speculative_steps, dtype=np.float32)
+        if self._is_tree_weights and self.num_speculative_steps > 15:
+            self._init_conf_np[15:] = 0.0
+        self._init_conf_gpu = torch.from_numpy(self._init_conf_np).to(device)
         for slot in self._stale_confidences:
-            slot.np.fill(1.0)
+            slot.np[:] = self._init_conf_np
 
     @staticmethod
     def _new_stats() -> dict[str, int]:
@@ -339,9 +355,11 @@ class AdaptiveVerificationManager:
             "admitted_drafts": 0,
         }
 
-    def pop_stats(self, reset: bool = True) -> dict[str, int]:
+    def pop_stats(self, reset: bool = True) -> dict[str, int | float]:
         """Budget statistics since the last reset: verified drafts per request-round = admitted_drafts / requests."""
-        stats = dict(self._stats)
+        stats: dict[str, int | float] = dict(self._stats)
+        if self._ctx_aware:
+            stats["ema_overhead_ms"] = round(self._ema_overhead_ms, 3)
         if reset:
             self._stats = self._new_stats()
         return stats
@@ -360,9 +378,9 @@ class AdaptiveVerificationManager:
         )
 
     def add_request(self, req_idx: int) -> None:
-        self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
+        self._stale_confidences[self._stale_idx].np[req_idx] = self._init_conf_np
         self._pending_resets.append(req_idx)
-        self._confidence_probs[req_idx].fill_(1.0)
+        self._confidence_probs[req_idx].copy_(self._init_conf_gpu)
 
     def batches_to_profile(self, capture_sizes: list[int]) -> Iterator[dict[str, int]]:
         """Dummy-run kwargs whose step timings seed the cost tables.
@@ -390,15 +408,16 @@ class AdaptiveVerificationManager:
                     "num_tokens": num_tokens,
                     "context_len": prof_ctx,
                 }
-        if self._ctx_aware and self._ctx_hi > self._ctx_lo and capture_sizes:
-            # 5 extra replays at ctx_hi to auto-calibrate KV-read slope beta_kv (ms / ctx_tok).
-            ref_candidates = [s for s in capture_sizes if s <= 256]
-            ref_n = ref_candidates[-1] if ref_candidates else capture_sizes[-1]
-            for _ in range(_PROFILE_REPLAYS):
-                yield {
-                    "num_tokens": ref_n,
-                    "context_len": self._ctx_hi,
-                }
+        if self._ctx_aware and self._ctx_hi > self._ctx_lo and all_sizes:
+            # Full dual-anchor 2D surface: also profile the complete (draft, verify)
+            # curves at ctx_hi so both drafter KV scaling and FA3 compute/KV overlap
+            # slopes are captured exactly across all batch/token sizes.
+            for num_tokens in all_sizes:
+                for _ in range(_PROFILE_REPLAYS):
+                    yield {
+                        "num_tokens": num_tokens,
+                        "context_len": self._ctx_hi,
+                    }
 
     def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
         def median_curve(
@@ -431,26 +450,41 @@ class AdaptiveVerificationManager:
             (s.num_target_tokens, s.forward_ms) for s in base_samples
         )
         self.set_cost_curves(draft_curve, verify_curve)
+        self._cost_tables_lo = self.cost_tables
 
         if hi_samples and self.cost_tables is not None:
-            t_hi = float(np.median([s.forward_ms for s in hi_samples]))
-            r_ref = max(1, hi_samples[0].num_reqs)
-            n_ref = hi_samples[0].num_target_tokens
-            t_lo = float(self.cost_tables[1][min(n_ref, len(self.cost_tables[1]) - 1)])
-            self._beta_kv_ms_per_tok = max(
-                0.0, (t_hi - t_lo) / (r_ref * (self._ctx_hi - self._ctx_lo))
+            draft_curve_hi = median_curve(
+                (s.num_reqs, s.drafter_ms) for s in hi_samples if s.full_cudagraph
             )
-            logger.info(
-                "Adaptive verification 2D context cost model: ctx_lo=%d -> ctx_hi=%d "
-                "(R=%d, N=%d, %.3f -> %.3f ms), beta_kv=%.6f ms/ctx_tok",
-                self._ctx_lo,
-                self._ctx_hi,
-                r_ref,
-                n_ref,
-                t_lo,
-                t_hi,
-                self._beta_kv_ms_per_tok,
+            verify_curve_hi = median_curve(
+                (s.num_target_tokens, s.forward_ms) for s in hi_samples
             )
+            draft_curve_hi, verify_curve_hi = get_tp_group().broadcast_object(
+                (draft_curve_hi, verify_curve_hi), src=0
+            )
+            if draft_curve_hi and verify_curve_hi:
+                self._cost_tables_hi = build_cost_tables_from_curves(
+                    draft_curve_hi,
+                    verify_curve_hi,
+                    self.req_states.max_num_reqs,
+                    self.req_states.max_num_batched_tokens,
+                    self._cudagraph_limit,
+                )
+                d_hi, v_hi = self._cost_tables_hi
+                picks_r = [
+                    n for n in (1, 2, 4, 8, 16, 32, 64, 96) if n < len(d_hi)
+                ]
+                picks_t = [
+                    n
+                    for n in (8, 32, 128, 256, 512, 1024, 2048, 4096)
+                    if n < len(v_hi)
+                ]
+                logger.info(
+                    "Adaptive verification 2D ctx_hi=%d curves (ms): drafter=%s, verify=%s",
+                    self._ctx_hi,
+                    [round(float(d_hi[n]), 3) for n in picks_r],
+                    [round(float(v_hi[n]), 3) for n in picks_t],
+                )
 
     def set_cost_curves(
         self,
@@ -503,7 +537,9 @@ class AdaptiveVerificationManager:
         with gpu_sync_allowed():
             self._copy_events[ready_idx].synchronize()
         if self._pending_resets:
-            self._stale_confidences[ready_idx].np[self._pending_resets] = 1.0
+            self._stale_confidences[ready_idx].np[self._pending_resets] = (
+                self._init_conf_np
+            )
             self._pending_resets.clear()
         # Last step's copy has landed: budgets read it, this step overwrites the
         # slot they were reading before.
@@ -577,21 +613,58 @@ class AdaptiveVerificationManager:
         num_tokens_to_estimated_accepted_tokens = np.concatenate(
             ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
         )
-        kv_extra_ms = 0.0
-        if self._ctx_aware and self._beta_kv_ms_per_tok > 0.0:
-            total_ctx = float(self.req_states.num_computed_tokens_np[slots].sum())
-            kv_extra_ms = self._beta_kv_ms_per_tok * max(
-                0.0, total_ctx - num_reqs * self._ctx_lo
-            )
-        costs = (
-            draft_cost_ms[len(req_ids)]
-            + kv_extra_ms
-            + verify_cost_ms[
-                num_non_draft_tokens_total : num_non_draft_tokens_total
-                + max_draft_budget
-                + 1
-            ]
+        now_ts = time.perf_counter()
+        is_pure_decode = (num_non_draft_tokens_total == num_reqs) and (num_reqs > 0)
+        if self._ctx_aware:
+            if (
+                is_pure_decode
+                and self._prev_step_ts is not None
+                and self._prev_modeled_ms is not None
+                and num_reqs == self._prev_pure_decode_reqs
+            ):
+                dt_ms = (now_ts - self._prev_step_ts) * 1000.0
+                if 0.2 <= dt_ms <= 200.0:
+                    resid = max(0.0, min(25.0, dt_ms - self._prev_modeled_ms))
+                    self._ema_overhead_ms = (
+                        0.95 * self._ema_overhead_ms + 0.05 * resid
+                    )
+
+        v_slice = slice(
+            num_non_draft_tokens_total,
+            num_non_draft_tokens_total + max_draft_budget + 1,
         )
+        if (
+            self._ctx_aware
+            and self._cost_tables_lo is not None
+            and self._cost_tables_hi is not None
+            and self._ctx_hi > self._ctx_lo
+        ):
+            mean_ctx = (
+                float(self.req_states.num_computed_tokens_np[slots].mean())
+                if num_reqs > 0
+                else float(self._ctx_lo)
+            )
+            w_hi = max(
+                0.0, (mean_ctx - self._ctx_lo) / (self._ctx_hi - self._ctx_lo)
+            )
+            d_lo, v_lo = self._cost_tables_lo
+            d_hi, v_hi = self._cost_tables_hi
+            if w_hi <= 1.0:
+                d_cost = (1.0 - w_hi) * float(d_lo[num_reqs]) + w_hi * float(
+                    d_hi[num_reqs]
+                )
+                v_cost = (1.0 - w_hi) * v_lo[v_slice] + w_hi * v_hi[v_slice]
+            else:
+                d_slope = max(0.0, float(d_hi[num_reqs]) - float(d_lo[num_reqs]))
+                v_slope = np.maximum(0.0, v_hi[v_slice] - v_lo[v_slice])
+                d_cost = float(d_hi[num_reqs]) + (w_hi - 1.0) * d_slope
+                v_cost = v_hi[v_slice] + (w_hi - 1.0) * v_slope
+            modeled_vec = d_cost + v_cost
+            costs = self._ema_overhead_ms + modeled_vec
+        else:
+            modeled_vec = draft_cost_ms[len(req_ids)] + verify_cost_ms[v_slice]
+            costs = modeled_vec
+
         num_drafts_per_req = {
             req_id: int(num_drafts)
             for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)
@@ -605,14 +678,7 @@ class AdaptiveVerificationManager:
         elif verify_mode == "lambda":
             d_ms = last_draft_ms()
             if d_ms is not None and d_ms > 0:
-                e_costs = (
-                    d_ms
-                    + verify_cost_ms[
-                        num_non_draft_tokens_total : num_non_draft_tokens_total
-                        + max_draft_budget
-                        + 1
-                    ]
-                )
+                e_costs = d_ms + verify_cost_ms[v_slice]
                 draft_budget = int(
                     np.argmax(num_tokens_to_estimated_accepted_tokens / e_costs)
                 )
@@ -624,6 +690,15 @@ class AdaptiveVerificationManager:
             draft_budget = int(
                 np.argmax(num_tokens_to_estimated_accepted_tokens / costs)
             )
+        if self._ctx_aware:
+            if is_pure_decode:
+                self._prev_step_ts = now_ts
+                self._prev_modeled_ms = float(modeled_vec[draft_budget])
+                self._prev_pure_decode_reqs = num_reqs
+            else:
+                self._prev_step_ts = None
+                self._prev_modeled_ms = None
+                self._prev_pure_decode_reqs = 0
         num_scheduled_drafts = int(scheduled_drafts.sum())
         self._stats["steps"] += 1
         self._stats["bound_steps"] += int(draft_budget < num_scheduled_drafts)
