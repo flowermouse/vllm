@@ -2207,13 +2207,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     nrp = input_batch.num_reqs_after_padding
                     if is_dummy_tree_cap:
                         # Preserve real context_len during adaptive_verification profiling
-                        # (dummy_run with context_len=8192) instead of forcing prefix=1.
+                        # (dummy_run with context_len=256/8192) instead of forcing prefix=1.
                         tree_state.step_prefix_lens[:nrp].copy_(
                             torch.clamp(
                                 input_batch.seq_lens[:nrp] - 1, min=1
                             ).to(torch.int32)
                         )
-                        max_pref = self.max_model_len
+                        max_pref = (
+                            max(1, context_len)
+                            if context_len > 0
+                            else 1
+                        )
                     else:
                         max_pref = (
                             self.max_model_len
@@ -2226,9 +2230,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     for m in attn_metadata.values():
                         if hasattr(m, "tree_mask"):
                             m.tree_mask = tree_state.step_tree_mask[:nrp]
+                            m.tree_bitmask = tree_state.step_tree_bitmask[:nrp]
                             m.tree_prefix_lens = tree_state.step_prefix_lens[:nrp]
                             m.max_tree_prefix_len = max_pref
                             m.tree_b1 = tree_state.b1
+                            m.tree_state = tree_state
                             if (
                                 not is_dummy_tree_cap
                                 and getattr(self, "_active_tree_mixed", False)

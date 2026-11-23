@@ -549,14 +549,16 @@ class FlashAttentionMetadata:
 
     causal: bool | torch.Tensor = True
 
-    # CRL Zero-Cost Conditional Tree Verification (Split-Tree FA3 + fused Triton)
+    # CRL Zero-Cost Conditional Tree Verification
     tree_mask: torch.Tensor | None = None
+    tree_bitmask: torch.Tensor | None = None
     tree_prefix_lens: torch.Tensor | None = None
     max_tree_prefix_len: int = 0
     tree_prefix_out_buf: torch.Tensor | None = None
     tree_mixed_req_ids: list[int] | None = None
     tree_mixed_q_ranges: list[tuple[int, int]] | None = None
     tree_b1: int = 0
+    tree_state: Any = None
 
     # PrefixLM bidirectional range containing each scheduled query token.
     # Shape: (num_actual_tokens, 2) int32, absolute [start, end] bounds;
@@ -1414,7 +1416,22 @@ class FlashAttentionImpl(AttentionImpl):
             if attn_metadata.tree_mask is not None:
                 from vllm.v1.worker.gpu.spec_decode.crl.tree import (
                     fused_intra_tree_and_merge_varlen,
+                    get_crl_tree_single_pass,
+                    get_crl_tree_single_pass_max_ctx,
+                    single_pass_tree_attention,
                 )
+
+                can_single_pass_base = (
+                    get_crl_tree_single_pass()
+                    and attn_metadata.tree_bitmask is not None
+                    and 0 < attn_metadata.tree_b1 <= 32
+                    and not is_quantized_kv_cache(self.kv_cache_dtype)
+                    and self.sliding_window is None
+                    and self.logits_soft_cap is None
+                    and self.alibi_slopes is None
+                    and self.sinks is None
+                )
+                sp_max_ctx = get_crl_tree_single_pass_max_ctx()
 
                 q_act = query[:num_actual_tokens]
                 k_act = key[:num_actual_tokens]
@@ -1589,48 +1606,68 @@ class FlashAttentionImpl(AttentionImpl):
                             kt = k_act[:tok_split]
                             vt = v_act[:tok_split]
                             out_t = out_act[:tok_split]
-                            out_p_t = (
-                                attn_metadata.tree_prefix_out_buf[:tok_split]
-                                if attn_metadata.tree_prefix_out_buf is not None
-                                else torch.empty_like(qt)
-                            )
-                            out_p_t, lse_p_t = flash_attn_varlen_func(
-                                q=qt,
-                                k=key_cache,
-                                v=value_cache,
-                                out=out_p_t,
-                                cu_seqlens_q=cu_t,
-                                max_seqlen_q=max_q_t,
-                                seqused_k=pref_t,
-                                max_seqlen_k=max(1, attn_metadata.max_tree_prefix_len),
-                                softmax_scale=self.scale,
-                                causal=False,
-                                alibi_slopes=self.alibi_slopes,
-                                window_size=sliding_window_size,
-                                block_table=bt_t,
-                                softcap=self.logits_soft_cap,
-                                return_softmax_lse=True,
-                                fa_version=self.vllm_flash_attn_version,
-                                q_descale=q_descale,
-                                k_descale=k_descale,
-                                v_descale=v_descale,
-                                num_splits=num_splits,
-                            )
-                            fused_intra_tree_and_merge_varlen(
-                                qt,
-                                kt,
-                                vt,
-                                out_p_t,
-                                lse_p_t,
-                                mask_t,
-                                cu_t,
-                                pref_t,
-                                out_t,
-                                self.scale,
-                                n_tree,
-                                max_q_t,
-                                mask_stride=attn_metadata.tree_b1,
-                            )
+                            if can_single_pass_base and (
+                                n_tree < 32
+                                or attn_metadata.max_tree_prefix_len <= sp_max_ctx
+                            ):
+                                single_pass_tree_attention(
+                                    q=qt,
+                                    key_cache=key_cache,
+                                    value_cache=value_cache,
+                                    out=out_t,
+                                    block_table=bt_t,
+                                    cu_seqlens_q=cu_t,
+                                    seqused_k=seqused_k[:n_tree],
+                                    tree_bitmask=attn_metadata.tree_bitmask[:n_tree],
+                                    max_seqlen_q=max_q_t,
+                                    sm_scale=self.scale,
+                                    tree_state=attn_metadata.tree_state,
+                                )
+                            else:
+                                out_p_t = (
+                                    attn_metadata.tree_prefix_out_buf[:tok_split]
+                                    if attn_metadata.tree_prefix_out_buf is not None
+                                    else torch.empty_like(qt)
+                                )
+                                out_p_t, lse_p_t = flash_attn_varlen_func(
+                                    q=qt,
+                                    k=key_cache,
+                                    v=value_cache,
+                                    out=out_p_t,
+                                    cu_seqlens_q=cu_t,
+                                    max_seqlen_q=max_q_t,
+                                    seqused_k=pref_t,
+                                    max_seqlen_k=max(
+                                        1, attn_metadata.max_tree_prefix_len
+                                    ),
+                                    softmax_scale=self.scale,
+                                    causal=False,
+                                    alibi_slopes=self.alibi_slopes,
+                                    window_size=sliding_window_size,
+                                    block_table=bt_t,
+                                    softcap=self.logits_soft_cap,
+                                    return_softmax_lse=True,
+                                    fa_version=self.vllm_flash_attn_version,
+                                    q_descale=q_descale,
+                                    k_descale=k_descale,
+                                    v_descale=v_descale,
+                                    num_splits=num_splits,
+                                )
+                                fused_intra_tree_and_merge_varlen(
+                                    qt,
+                                    kt,
+                                    vt,
+                                    out_p_t,
+                                    lse_p_t,
+                                    mask_t,
+                                    cu_t,
+                                    pref_t,
+                                    out_t,
+                                    self.scale,
+                                    n_tree,
+                                    max_q_t,
+                                    mask_stride=attn_metadata.tree_b1,
+                                )
                         return output
 
                     # General fallback (non-contiguous tree request indices):
@@ -1707,6 +1744,26 @@ class FlashAttentionImpl(AttentionImpl):
                         out_act[tok_idx] = out_tree
                     return output
 
+                num_reqs_tree = cu_seqlens_q.shape[0] - 1
+                if can_single_pass_base and (
+                    num_reqs_tree < 32
+                    or attn_metadata.max_tree_prefix_len <= sp_max_ctx
+                ):
+                    single_pass_tree_attention(
+                        q=q_act,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        out=out_act,
+                        block_table=block_table,
+                        cu_seqlens_q=cu_seqlens_q,
+                        seqused_k=seqused_k,
+                        tree_bitmask=attn_metadata.tree_bitmask,
+                        max_seqlen_q=max_seqlen_q,
+                        sm_scale=self.scale,
+                        tree_state=attn_metadata.tree_state,
+                    )
+                    return output
+
                 out_p = (
                     attn_metadata.tree_prefix_out_buf[:num_actual_tokens]
                     if attn_metadata.tree_prefix_out_buf is not None
@@ -1734,7 +1791,6 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale=v_descale,
                     num_splits=num_splits,
                 )
-                num_reqs_tree = cu_seqlens_q.shape[0] - 1
                 fused_intra_tree_and_merge_varlen(
                     q_act,
                     k_act,

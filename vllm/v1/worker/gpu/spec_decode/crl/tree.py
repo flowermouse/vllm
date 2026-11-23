@@ -43,6 +43,19 @@ def get_crl_tree_stoch_alpha_base() -> float:
     return float(os.environ.get("VLLM_CRL_TREE_STOCH_ALPHA_BASE", "0.50"))
 
 
+def get_crl_tree_single_pass() -> bool:
+    """Whether to use the unified single-pass Split-KV Triton tree attention kernel
+    (default True; set 0 to force 2-pass Split-Tree FA3 + Triton merge)."""
+    return os.environ.get("VLLM_CRL_TREE_SINGLE_PASS", "1") == "1"
+
+
+def get_crl_tree_single_pass_max_ctx() -> int:
+    """Max prefix context length for single-pass Triton tree attention at high
+    concurrency (num_reqs >= 32). Beyond this threshold, falls back to 2-pass
+    FA3 prefix + Triton intra-tree merge to preserve FA3 TMA long-KV bandwidth."""
+    return int(os.environ.get("VLLM_CRL_TREE_SINGLE_PASS_MAX_CTX", "2048"))
+
+
 # ---------------------------------------------------------------------------
 # 1. GPU Top-B Conditional Tree Builder (Triton, 1 program per request)
 # ---------------------------------------------------------------------------
@@ -521,6 +534,374 @@ def fused_intra_tree_and_merge_varlen(
 
 
 # ---------------------------------------------------------------------------
+# 2b. Unified Single-Pass Split-KV Paged-KV Tree Attention (Triton)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _single_pass_tree_attn_kernel(
+    Q_ptr,  # [total_q, H_q, D]
+    K_cache_ptr,  # [num_blocks, page_size, H_kv, D]
+    V_cache_ptr,  # [num_blocks, page_size, H_kv, D]
+    Out_ptr,  # [total_q, H_q, D] (used when NUM_SPLITS == 1)
+    Split_o_ptr,  # [total_q, H_q, NUM_SPLITS, D] fp32 (when NUM_SPLITS > 1)
+    Split_lse_ptr,  # [total_q, H_q, NUM_SPLITS] fp32 (when NUM_SPLITS > 1)
+    Block_table_ptr,  # [B, max_pages] int32
+    Cu_q_ptr,  # [B + 1] int32
+    Seq_k_ptr,  # [B] int32 (prefix_len + q_len)
+    Bitmasks_ptr,  # [B, 32] int32 (packed uint32 ancestor bitmask per row)
+    sm_scale: tl.constexpr,
+    stride_qt,
+    stride_qh,
+    stride_kb,
+    stride_kp,
+    stride_kh,
+    stride_vb,
+    stride_vp,
+    stride_vh,
+    stride_ot,
+    stride_oh,
+    stride_sot,
+    stride_soh,
+    stride_sos,
+    stride_slt,
+    stride_slh,
+    stride_bt_b,
+    stride_bm_b,
+    G: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h_kv = tl.program_id(1)
+    pid_ms = tl.program_id(2)
+    pid_m = pid_ms // NUM_SPLITS
+    split_id = pid_ms % NUM_SPLITS
+
+    q_start = tl.load(Cu_q_ptr + b)
+    q_end = tl.load(Cu_q_ptr + b + 1)
+    q_len = q_end - q_start
+    if (q_len <= 0) | (pid_m * BLOCK_M >= q_len * G):
+        return
+
+    seq_k = tl.load(Seq_k_ptr + b)
+    prefix_len = tl.maximum(seq_k - q_len, 0)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    q_local = offs_m // G
+    g = offs_m % G
+    h_q = h_kv * G + g
+    q_valid = q_local < q_len
+
+    total_n_blocks = (seq_k + BLOCK_N - 1) // BLOCK_N
+    if NUM_SPLITS > 1:
+        blocks_per_split = (total_n_blocks + NUM_SPLITS - 1) // NUM_SPLITS
+        blk_start = split_id * blocks_per_split
+        blk_end = tl.minimum(blk_start + blocks_per_split, total_n_blocks)
+        if blk_start >= blk_end:
+            lse_ptrs = (
+                Split_lse_ptr
+                + (q_start + q_local) * stride_slt
+                + h_q * stride_slh
+                + split_id
+            )
+            tl.store(lse_ptrs, float("-inf"), mask=q_valid)
+            return
+    else:
+        blk_start = 0
+        blk_end = total_n_blocks
+
+    offs_d = tl.arange(0, HEAD_DIM)
+    safe_q_local = tl.minimum(q_local, tl.maximum(q_len - 1, 0))
+    q_ptrs = (
+        Q_ptr
+        + (q_start + safe_q_local)[:, None] * stride_qt
+        + h_q[:, None] * stride_qh
+        + offs_d[None, :]
+    )
+    q = tl.load(q_ptrs, mask=q_valid[:, None], other=0.0)
+
+    row_bm = tl.load(
+        Bitmasks_ptr + b * stride_bm_b + tl.minimum(safe_q_local, 31),
+        mask=q_valid,
+        other=0,
+    ).to(tl.uint32)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    sm_scale_log2: tl.constexpr = sm_scale * 1.4426950408889634
+    offs_n = tl.arange(0, BLOCK_N)
+    bt_base = Block_table_ptr + b * stride_bt_b
+    k_base = K_cache_ptr + h_kv * stride_kh
+    v_base = V_cache_ptr + h_kv * stride_vh
+
+    # Loop 1: Full unmasked prefix blocks [blk_start, min(blk_end, prefix_full_blocks))
+    # Coalesced [BLOCK_N, HEAD_DIM] vector loads on both K and V (stride-1 along HEAD_DIM).
+    prefix_full_blocks = tl.maximum(prefix_len, 0) // BLOCK_N
+    unmasked_end = tl.minimum(blk_end, prefix_full_blocks)
+    for blk in range(blk_start, unmasked_end):
+        pos_k = blk * BLOCK_N + offs_n
+        page_idx = tl.load(bt_base + (pos_k // PAGE_SIZE)).to(tl.int64)
+        page_off = (pos_k % PAGE_SIZE).to(tl.int64)
+
+        k_ptrs = (
+            k_base + page_idx[:, None] * stride_kb + page_off[:, None] * stride_kp + offs_d[None, :]
+        )
+        k = tl.load(k_ptrs)
+        qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * sm_scale_log2
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        p = tl.math.exp2(qk - m_ij[:, None])
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, 1)
+
+        v_ptrs = (
+            v_base + page_idx[:, None] * stride_vb + page_off[:, None] * stride_vp + offs_d[None, :]
+        )
+        v = tl.load(v_ptrs)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
+        m_i = m_ij
+
+    # Loop 2: Tail prefix + intra-tree bitmask blocks [max(blk_start, prefix_full_blocks), blk_end)
+    masked_start = tl.maximum(blk_start, prefix_full_blocks)
+    for blk in range(masked_start, blk_end):
+        pos_k = blk * BLOCK_N + offs_n
+        kv_valid = pos_k < seq_k
+        safe_pos_k = tl.minimum(pos_k, tl.maximum(seq_k - 1, 0))
+        page_idx = tl.load(
+            bt_base + (safe_pos_k // PAGE_SIZE), mask=kv_valid, other=0
+        ).to(tl.int64)
+        page_off = (safe_pos_k % PAGE_SIZE).to(tl.int64)
+
+        k_ptrs = (
+            k_base + page_idx[:, None] * stride_kb + page_off[:, None] * stride_kp + offs_d[None, :]
+        )
+        k = tl.load(k_ptrs, mask=kv_valid[:, None], other=0.0)
+        qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * sm_scale_log2
+
+        rel_k = pos_k[None, :] - prefix_len
+        in_prefix = rel_k < 0
+        shift = tl.maximum(tl.minimum(rel_k, 31), 0).to(tl.uint32)
+        in_tree = (rel_k < q_len) & (((row_bm[:, None] >> shift) & 1) != 0)
+        keep = kv_valid[None, :] & (in_prefix | in_tree)
+        qk = tl.where(keep, qk, float("-inf"))
+
+        row_max = tl.max(qk, 1)
+        m_ij = tl.maximum(m_i, row_max)
+        safe_m_ij = tl.where(m_ij == float("-inf"), 0.0, m_ij)
+        p = tl.math.exp2(qk - safe_m_ij[:, None])
+        safe_m_i = tl.where(m_i == float("-inf"), 0.0, m_i)
+        alpha = tl.where(m_i == float("-inf"), 0.0, tl.math.exp2(safe_m_i - safe_m_ij))
+        l_i = l_i * alpha + tl.sum(p, 1)
+
+        v_ptrs = (
+            v_base + page_idx[:, None] * stride_vb + page_off[:, None] * stride_vp + offs_d[None, :]
+        )
+        v = tl.load(v_ptrs, mask=kv_valid[:, None], other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
+        m_i = m_ij
+
+    out_val = acc / tl.maximum(l_i[:, None], 1e-20)
+    if NUM_SPLITS == 1:
+        out_ptrs = (
+            Out_ptr
+            + (q_start + q_local)[:, None] * stride_ot
+            + h_q[:, None] * stride_oh
+            + offs_d[None, :]
+        )
+        tl.store(out_ptrs, out_val.to(Out_ptr.dtype.element_ty), mask=q_valid[:, None])
+    else:
+        has_mass = (m_i > float("-inf")) & (l_i > 0.0)
+        lse_val = tl.where(
+            has_mass, m_i + tl.math.log2(tl.maximum(l_i, 1e-20)), float("-inf")
+        )
+        so_ptrs = (
+            Split_o_ptr
+            + (q_start + q_local)[:, None] * stride_sot
+            + h_q[:, None] * stride_soh
+            + split_id * stride_sos
+            + offs_d[None, :]
+        )
+        tl.store(so_ptrs, out_val, mask=q_valid[:, None])
+        sl_ptrs = (
+            Split_lse_ptr
+            + (q_start + q_local) * stride_slt
+            + h_q * stride_slh
+            + split_id
+        )
+        tl.store(sl_ptrs, lse_val, mask=q_valid)
+
+
+@triton.jit
+def _single_pass_tree_reduce_kernel(
+    Split_o_ptr,  # [total_q, H_q, NUM_SPLITS, D] fp32
+    Split_lse_ptr,  # [total_q, H_q, NUM_SPLITS] fp32
+    Out_ptr,  # [total_q, H_q, D] bf16/fp16
+    stride_sot,
+    stride_soh,
+    stride_sos,
+    stride_slt,
+    stride_slh,
+    stride_ot,
+    stride_oh,
+    HEAD_DIM: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    tok = tl.program_id(0)
+    h = tl.program_id(1)
+    offs_s = tl.arange(0, BLOCK_S)
+    s_mask = offs_s < NUM_SPLITS
+    lse = tl.load(
+        Split_lse_ptr + tok * stride_slt + h * stride_slh + offs_s,
+        mask=s_mask,
+        other=float("-inf"),
+    )
+    m_max = tl.max(lse, axis=0)
+    safe_m = tl.where(m_max == float("-inf"), 0.0, m_max)
+    w = tl.where(s_mask & (lse > float("-inf")), tl.math.exp2(lse - safe_m), 0.0)
+    denom = tl.maximum(tl.sum(w, axis=0), 1e-20)
+    w_norm = w / denom
+
+    offs_d = tl.arange(0, HEAD_DIM)
+    so_base = Split_o_ptr + tok * stride_sot + h * stride_soh
+    acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+    for s in tl.static_range(NUM_SPLITS):
+        ws = tl.sum(tl.where(offs_s == s, w_norm, 0.0), axis=0)
+        if ws > 0.0:
+            sv = tl.load(so_base + s * stride_sos + offs_d)
+            acc += ws * sv
+
+    tl.store(
+        Out_ptr + tok * stride_ot + h * stride_oh + offs_d,
+        acc.to(Out_ptr.dtype.element_ty),
+    )
+
+
+def single_pass_tree_attention(
+    q: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    tree_bitmask: torch.Tensor,
+    max_seqlen_q: int,
+    sm_scale: float,
+    tree_state: CRLTreeState | None = None,
+) -> None:
+    """Unified single-pass Split-KV Paged-KV + uint32 Tree Bitmask attention."""
+    total_q, H_q, D = q.shape
+    page_size = key_cache.shape[1]
+    H_kv = key_cache.shape[2]
+    G = H_q // H_kv
+    num_reqs = seqused_k.shape[0]
+    if total_q == 0 or num_reqs == 0:
+        return
+
+    # Deterministic per-(num_reqs, H_kv) split count (100% FULL CUDA Graph safe)
+    total_ctas = num_reqs * H_kv
+    if total_ctas >= 64:
+        num_splits = 1
+    elif total_ctas >= 16:
+        num_splits = 4
+    else:
+        num_splits = 8
+
+    mq_g = max_seqlen_q * G
+    if mq_g >= 48:
+        block_m = 64
+    elif mq_g >= 17:
+        block_m = 32
+    else:
+        block_m = 16
+    n_warps = 4
+    block_n = 64
+    num_m_tiles = triton.cdiv(mq_g, block_m)
+
+    if num_splits > 1:
+        if tree_state is not None:
+            split_o, split_lse = tree_state.get_split_bufs(
+                total_q, H_q, num_splits, D, q.device
+            )
+        else:
+            split_o = torch.empty(
+                (total_q, H_q, num_splits, D), dtype=torch.float32, device=q.device
+            )
+            split_lse = torch.empty(
+                (total_q, H_q, num_splits), dtype=torch.float32, device=q.device
+            )
+    else:
+        # Dummy pointers (unused when NUM_SPLITS == 1)
+        split_o = out
+        split_lse = seqused_k
+
+    grid = (num_reqs, H_kv, num_m_tiles * num_splits)
+    _single_pass_tree_attn_kernel[grid](
+        q,
+        key_cache,
+        value_cache,
+        out,
+        split_o,
+        split_lse,
+        block_table,
+        cu_seqlens_q,
+        seqused_k,
+        tree_bitmask,
+        sm_scale=sm_scale,
+        stride_qt=q.stride(0),
+        stride_qh=q.stride(1),
+        stride_kb=key_cache.stride(0),
+        stride_kp=key_cache.stride(1),
+        stride_kh=key_cache.stride(2),
+        stride_vb=value_cache.stride(0),
+        stride_vp=value_cache.stride(1),
+        stride_vh=value_cache.stride(2),
+        stride_ot=out.stride(0),
+        stride_oh=out.stride(1),
+        stride_sot=split_o.stride(0),
+        stride_soh=split_o.stride(1) if split_o.ndim >= 3 else 1,
+        stride_sos=split_o.stride(2) if split_o.ndim >= 4 else 1,
+        stride_slt=split_lse.stride(0),
+        stride_slh=split_lse.stride(1) if split_lse.ndim >= 2 else 1,
+        stride_bt_b=block_table.stride(0),
+        stride_bm_b=tree_bitmask.stride(0),
+        G=G,
+        HEAD_DIM=D,
+        PAGE_SIZE=page_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        NUM_SPLITS=num_splits,
+        num_warps=n_warps,
+        num_stages=3,
+    )
+
+    if num_splits > 1:
+        _single_pass_tree_reduce_kernel[(total_q, H_q)](
+            split_o,
+            split_lse,
+            out,
+            stride_sot=split_o.stride(0),
+            stride_soh=split_o.stride(1),
+            stride_sos=split_o.stride(2),
+            stride_slt=split_lse.stride(0),
+            stride_slh=split_lse.stride(1),
+            stride_ot=out.stride(0),
+            stride_oh=out.stride(1),
+            HEAD_DIM=D,
+            NUM_SPLITS=num_splits,
+            BLOCK_S=triton.next_power_of_2(num_splits),
+            num_warps=2,
+        )
+
+
+# ---------------------------------------------------------------------------
 # 3. Tree Position Assignment + Step Mask Gather (CUDA-Graph safe)
 # ---------------------------------------------------------------------------
 
@@ -536,6 +917,7 @@ def _prepare_tree_step_kernel(
     positions_ptr,  # [num_tokens] int64 (in/out)
     step_prefix_lens_ptr,  # [max_num_reqs] int32 (out)
     step_tree_mask_ptr,  # [max_num_reqs, B1, B1] uint8 (out)
+    step_tree_bitmask_ptr,  # [max_num_reqs, 32] int32 (out, packed uint32 per row)
     B1: tl.constexpr,
     BLOCK_B1: tl.constexpr,
 ):
@@ -546,6 +928,7 @@ def _prepare_tree_step_kernel(
 
     if tl.load(is_tree_req_ptr + r) == 0:
         tl.store(step_tree_mask_ptr + r * B1 * B1 + 0, 1)
+        tl.store(step_tree_bitmask_ptr + r * 32 + 0, 1)
         return
 
     q_start = tl.load(query_start_loc_ptr + r)
@@ -561,13 +944,20 @@ def _prepare_tree_step_kernel(
         positions_ptr + q_start + offs, (pref_len + depths).to(tl.int64), mask=valid
     )
 
-    # Copy tree_mask[req_state] -> step_tree_mask[r]
+    # Copy tree_mask[req_state] -> step_tree_mask[r] and pack uint32 row bitmasks
     src_m = tree_mask_ptr + req_state * B1 * B1
     dst_m = step_tree_mask_ptr + r * B1 * B1
     b1_mask = offs < B1
+    bit_weights = tl.cast(1, tl.uint32) << tl.minimum(offs, 31).to(tl.uint32)
     for row in range(B1):
         vals = tl.load(src_m + row * B1 + offs, mask=b1_mask, other=0)
         tl.store(dst_m + row * B1 + offs, vals, mask=b1_mask)
+        if B1 <= 32:
+            bits = tl.sum(
+                tl.where(b1_mask & (vals != 0), bit_weights, tl.cast(0, tl.uint32)),
+                axis=0,
+            )
+            tl.store(step_tree_bitmask_ptr + r * 32 + row, bits.to(tl.int32))
 
 
 # ---------------------------------------------------------------------------
@@ -1433,8 +1823,15 @@ class CRLTreeState:
         self.step_tree_mask = torch.zeros(
             max_num_reqs, self.b1, self.b1, dtype=torch.uint8, device=device
         )
+        self.step_tree_bitmask = torch.zeros(
+            max_num_reqs, 32, dtype=torch.int32, device=device
+        )
         for i in range(self.b1):
             self.step_tree_mask[:, i, : i + 1] = 1
+            if i < 32:
+                bm_u32 = (1 << (i + 1)) - 1
+                bm_i32 = bm_u32 - (1 << 32) if bm_u32 >= (1 << 31) else bm_u32
+                self.step_tree_bitmask[:, i] = bm_i32
 
         # Verification output buffers
         self.step_acc_nodes = torch.zeros(
@@ -1457,8 +1854,43 @@ class CRLTreeState:
         self._lse_part_sum: torch.Tensor | None = None
         # Pre-allocated prefix attention output buffer (lazy-sized on first use)
         self._prefix_out_buf: torch.Tensor | None = None
+        # Pre-allocated Split-KV scratch buffers for single-pass tree attention
+        # (fixed addresses for FULL CUDA Graph capture & replay; max 8 splits * 256 tok)
+        self._split_o_buf: torch.Tensor | None = None
+        self._split_lse_buf: torch.Tensor | None = None
         # Cached device pointer table for single-launch batched 36-layer KV compaction
         self._kv_ptrs_cache: tuple[int, torch.Tensor] | None = None
+
+    def get_split_bufs(
+        self,
+        total_q: int,
+        num_heads: int,
+        num_splits: int,
+        head_dim: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Pre-allocate generous capacity (at least 256 tokens * 8 splits) on first
+        # call so subsequent CUDA Graph buckets reuse the same fixed addresses.
+        cap_q = max(total_q, 256)
+        cap_s = max(num_splits, 8)
+        if (
+            self._split_o_buf is None
+            or self._split_o_buf.shape[0] < total_q
+            or self._split_o_buf.shape[1] != num_heads
+            or self._split_o_buf.shape[2] < num_splits
+            or self._split_o_buf.shape[3] != head_dim
+        ):
+            self._split_o_buf = torch.empty(
+                (cap_q, num_heads, cap_s, head_dim), dtype=torch.float32, device=device
+            )
+            self._split_lse_buf = torch.empty(
+                (cap_q, num_heads, cap_s), dtype=torch.float32, device=device
+            )
+        assert self._split_lse_buf is not None
+        return (
+            self._split_o_buf[:total_q, :, :num_splits, :],
+            self._split_lse_buf[:total_q, :, :num_splits],
+        )
 
     def get_prefix_out_buf(self, like: torch.Tensor) -> torch.Tensor:
         if (
@@ -1570,6 +2002,7 @@ class CRLTreeState:
             positions,
             self.step_prefix_lens,
             self.step_tree_mask,
+            self.step_tree_bitmask,
             B1=self.b1,
             BLOCK_B1=BLOCK_B1,
             num_warps=2,
