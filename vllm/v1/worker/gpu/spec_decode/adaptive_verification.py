@@ -266,8 +266,9 @@ class AdaptiveVerificationManager:
         from vllm.v1.worker.gpu.spec_decode.crl.tree import get_crl_tree_budget
 
         self._is_tree_weights = get_crl_tree_budget() > 0
-        self._ctx_aware = self._is_tree_weights or (
-            os.environ.get("VLLM_ADAPTIVE_VERIFICATION_CTX_AWARE", "0") == "1"
+        ctx_env = os.environ.get("VLLM_ADAPTIVE_VERIFICATION_CTX_AWARE")
+        self._ctx_aware = (
+            self._is_tree_weights if ctx_env is None else (ctx_env == "1")
         )
         self._ctx_lo = 256
         self._ctx_hi = envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN
