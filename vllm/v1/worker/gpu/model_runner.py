@@ -1883,6 +1883,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                 )
             self._step_acc_nodes = acc_nodes
+            from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+
+            num_sampled, num_rejected = get_num_sampled_and_rejected(
+                num_sampled,
+                input_batch.seq_lens,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                self.req_states.prefill_len.gpu,
+            )
             sampler_output = SamplerOutput(
                 sampled_token_ids=sampled_token_ids,
                 logprobs_tensors=None,
