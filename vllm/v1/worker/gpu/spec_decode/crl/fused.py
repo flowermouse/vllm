@@ -888,6 +888,130 @@ def _elastic_auction_kernel(
         tl.atomic_add(out_gu_ptr + req, 1, mask=take_u)
 
 
+@triton.jit(do_not_specialize=["R", "N", "vfloor_f", "vslope_f"])
+def _elastic_floor7_auction_kernel(
+    sv_ptr,  # [N=2*R] fp32 sorted extension tickets (7->11, 11->15)
+    sver_ptr,  # [N] fp32 sorted verified tokens for extension tickets
+    sval_ptr,  # [N] bool/uint8 sorted valid
+    order_ptr,  # [N] int64 sorted flat index (req = order // 2)
+    y0_ptr,  # [1] fp32 base expected tokens for chain-7 floor (incl bonus)
+    d0_ptr,  # [1] fp32 base expected verified drafts for chain-7 floor
+    rows_ptr,  # [M] fp32 draft rows
+    ms_ptr,  # [M] fp32 draft ms
+    vcost_ptr,  # [V_LEN] fp32 verify cost
+    out_g_ptr,  # [R] int32 (initialized to 2 for decode, 0 otherwise)
+    out_gu_ptr,  # [R] int32 (initialized to 2 for decode, 0 otherwise)
+    out_lam_ptr,  # [1] fp32
+    decode_ptr,  # [R] bool/uint8
+    p_next_ptr,  # [1] fp32
+    vfloor_f,
+    vslope_f,
+    R,
+    N,
+    M: tl.constexpr,
+    V_LEN: tl.constexpr,
+    HAS_VCOST: tl.constexpr,
+    BLOCK: tl.constexpr,
+    MAX_Q_ROWS: tl.constexpr = 999999,
+    HAS_GU: tl.constexpr = 0,
+):
+    if tl.program_id(0) != 0:
+        return
+    idx = tl.arange(0, BLOCK)
+    p_next_f = tl.load(p_next_ptr)
+    y0 = tl.load(y0_ptr)
+    d0 = tl.load(d0_ptr)
+    req_mask = idx < R
+    r_f = tl.sum(
+        tl.where(
+            req_mask, tl.load(decode_ptr + idx, mask=req_mask, other=0) != 0, 0
+        ).to(tl.float32),
+        axis=0,
+    )
+    q0 = 8.0 * r_f
+    mask = idx < N
+    sv = tl.load(sv_ptr + idx, mask=mask, other=0.0)
+    sver = tl.load(sver_ptr + idx, mask=mask, other=0.0)
+    sval = tl.load(sval_ptr + idx, mask=mask, other=0) != 0
+    srow = tl.where(sval, 4.0, 0.0)
+
+    c_y = y0 + tl.cumsum(sv, axis=0)
+    c_ver = d0 + tl.cumsum(sver, axis=0)
+    c_rows = q0 + tl.cumsum(srow, axis=0)
+
+    # Piecewise-linear t_draft(q0) and t_draft(c_rows)
+    r0 = tl.load(rows_ptr)
+    m0 = tl.load(ms_ptr)
+    td = tl.full([BLOCK], m0, dtype=tl.float32)
+    td0 = m0
+    for j in range(1, M):
+        rj = tl.load(rows_ptr + j)
+        mj = tl.load(ms_ptr + j)
+        span = tl.maximum(rj - r0, 1e-6)
+        in_seg = (c_rows > r0) & (c_rows <= rj)
+        interp = m0 + (mj - m0) * ((c_rows - r0) / span)
+        td = tl.where(in_seg, interp, td)
+        in_seg0 = (q0 > r0) & (q0 <= rj)
+        interp0 = m0 + (mj - m0) * ((q0 - r0) / span)
+        td0 = tl.where(in_seg0, interp0, td0)
+        if j == M - 1:
+            td = tl.where(c_rows > rj, mj, td)
+            td0 = tl.where(q0 > rj, mj, td0)
+        r0 = rj
+        m0 = mj
+
+    if HAS_VCOST:
+        n1 = tl.minimum(
+            tl.maximum(tl.extra.cuda.libdevice.llrint(r_f + c_ver), 0), V_LEN - 1
+        )
+        tv1 = tl.load(vcost_ptr + n1)
+        n1_0 = tl.minimum(
+            tl.maximum(tl.extra.cuda.libdevice.llrint(r_f + d0), 0), V_LEN - 1
+        )
+        tv1_0 = tl.load(vcost_ptr + n1_0)
+        n2 = tl.minimum(
+            tl.maximum(tl.extra.cuda.libdevice.llrint(p_next_f + r_f + c_ver), 0),
+            V_LEN - 1,
+        )
+        tv2 = tl.load(vcost_ptr + n2)
+        n2_0 = tl.minimum(
+            tl.maximum(tl.extra.cuda.libdevice.llrint(p_next_f + r_f + d0), 0),
+            V_LEN - 1,
+        )
+        tv2_0 = tl.load(vcost_ptr + n2_0)
+    else:
+        tv1 = vfloor_f + vslope_f * tl.maximum(r_f + c_ver, 0.0)
+        tv1_0 = vfloor_f + vslope_f * tl.maximum(r_f + d0, 0.0)
+        tv2 = vfloor_f + vslope_f * tl.maximum(p_next_f + r_f + c_ver, 0.0)
+        tv2_0 = vfloor_f + vslope_f * tl.maximum(p_next_f + r_f + d0, 0.0)
+
+    feasible_u = mask
+    feasible = mask & (c_rows <= MAX_Q_ROWS)
+    rate0 = y0 / tl.maximum(td0 + tv1_0, 1e-6)
+    rate = tl.where(feasible_u, c_y / tl.maximum(td + tv1, 1e-6), -1e30)
+    lam = tl.maximum(rate0, tl.max(rate, axis=0))
+    tl.store(out_lam_ptr, lam)
+
+    util0 = y0 - lam * (td0 + tv2_0)
+    util_cap = tl.where(feasible, c_y - lam * (td + tv2), -1e30)
+    best_u = tl.max(util_cap, axis=0)
+    best_idx = tl.argmax(util_cap, axis=0, tie_break_left=True)
+    k_tot = tl.where(util0 >= best_u, 0, best_idx + 1)
+
+    take = feasible & sval & (idx < k_tot)
+    order = tl.load(order_ptr + idx, mask=mask, other=0)
+    req = order // 2
+    tl.atomic_add(out_g_ptr + req, 1, mask=take)
+
+    if HAS_GU:
+        util_u = tl.where(feasible_u, c_y - lam * (td + tv2), -1e30)
+        best_uu = tl.max(util_u, axis=0)
+        best_idx_u = tl.argmax(util_u, axis=0, tie_break_left=True)
+        k_tot_u = tl.where(util0 >= best_uu, 0, best_idx_u + 1)
+        take_u = feasible_u & sval & (idx < k_tot_u)
+        tl.atomic_add(out_gu_ptr + req, 1, mask=take_u)
+
+
 @triton.jit(do_not_specialize=["R"])
 def _elastic_cap_publish_kernel(
     g_base_ptr,  # [R] int32 (auction result, already <= MAX_Q_ROWS)

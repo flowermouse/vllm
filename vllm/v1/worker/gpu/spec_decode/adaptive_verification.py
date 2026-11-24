@@ -267,9 +267,7 @@ class AdaptiveVerificationManager:
 
         self._is_tree_weights = get_crl_tree_budget() > 0
         ctx_env = os.environ.get("VLLM_ADAPTIVE_VERIFICATION_CTX_AWARE")
-        self._ctx_aware = (
-            self._is_tree_weights if ctx_env is None else (ctx_env == "1")
-        )
+        self._ctx_aware = self._is_tree_weights if ctx_env is None else (ctx_env == "1")
         self._ctx_lo = 256
         self._ctx_hi = envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN
         self._num_base_profile_samples = 0
@@ -282,6 +280,8 @@ class AdaptiveVerificationManager:
         self._prev_step_ts: float | None = None
         self._prev_modeled_ms: float | None = None
         self._prev_pure_decode_reqs: int = 0
+        self._last_vcost_pub_ctx: float = -1.0e9
+        self._last_vcost_pub_ovh: float = -1.0e9
         device = req_states.device
         self._copy_stream = torch.cuda.Stream(device)
 
@@ -472,13 +472,9 @@ class AdaptiveVerificationManager:
                     self._cudagraph_limit,
                 )
                 d_hi, v_hi = self._cost_tables_hi
-                picks_r = [
-                    n for n in (1, 2, 4, 8, 16, 32, 64, 96) if n < len(d_hi)
-                ]
+                picks_r = [n for n in (1, 2, 4, 8, 16, 32, 64, 96) if n < len(d_hi)]
                 picks_t = [
-                    n
-                    for n in (8, 32, 128, 256, 512, 1024, 2048, 4096)
-                    if n < len(v_hi)
+                    n for n in (8, 32, 128, 256, 512, 1024, 2048, 4096) if n < len(v_hi)
                 ]
                 logger.info(
                     "Adaptive verification 2D ctx_hi=%d curves (ms): drafter=%s, verify=%s",
@@ -626,9 +622,7 @@ class AdaptiveVerificationManager:
                 dt_ms = (now_ts - self._prev_step_ts) * 1000.0
                 if 0.2 <= dt_ms <= 200.0:
                     resid = max(0.0, min(25.0, dt_ms - self._prev_modeled_ms))
-                    self._ema_overhead_ms = (
-                        0.95 * self._ema_overhead_ms + 0.05 * resid
-                    )
+                    self._ema_overhead_ms = 0.95 * self._ema_overhead_ms + 0.05 * resid
 
         v_slice = slice(
             num_non_draft_tokens_total,
@@ -645,9 +639,7 @@ class AdaptiveVerificationManager:
                 if num_reqs > 0
                 else float(self._ctx_lo)
             )
-            w_hi = max(
-                0.0, (mean_ctx - self._ctx_lo) / (self._ctx_hi - self._ctx_lo)
-            )
+            w_hi = max(0.0, (mean_ctx - self._ctx_lo) / (self._ctx_hi - self._ctx_lo))
             d_lo, v_lo = self._cost_tables_lo
             d_hi, v_hi = self._cost_tables_hi
             if w_hi <= 1.0:
@@ -662,9 +654,30 @@ class AdaptiveVerificationManager:
                 v_cost = v_hi[v_slice] + (w_hi - 1.0) * v_slope
             modeled_vec = d_cost + v_cost
             costs = self._ema_overhead_ms + modeled_vec
+            v_slice_2d = v_cost + self._ema_overhead_ms
+            if verify_mode and (
+                abs(mean_ctx - self._last_vcost_pub_ctx) >= 64.0
+                or abs(self._ema_overhead_ms - self._last_vcost_pub_ovh) >= 0.1
+            ):
+                if w_hi <= 1.0:
+                    v_full = (1.0 - w_hi) * v_lo + w_hi * v_hi + self._ema_overhead_ms
+                else:
+                    v_full = (
+                        v_hi
+                        + (w_hi - 1.0) * np.maximum(0.0, v_hi - v_lo)
+                        + self._ema_overhead_ms
+                    )
+                from vllm.v1.worker.gpu.spec_decode.crl.elastic_plan import (
+                    publish_verify_cost_async,
+                )
+
+                publish_verify_cost_async(v_full)
+                self._last_vcost_pub_ctx = mean_ctx
+                self._last_vcost_pub_ovh = self._ema_overhead_ms
         else:
             modeled_vec = draft_cost_ms[len(req_ids)] + verify_cost_ms[v_slice]
             costs = modeled_vec
+            v_slice_2d = None
 
         num_drafts_per_req = {
             req_id: int(num_drafts)
@@ -679,13 +692,19 @@ class AdaptiveVerificationManager:
         elif verify_mode == "lambda":
             d_ms = last_draft_ms()
             if d_ms is not None and d_ms > 0:
-                e_costs = d_ms + verify_cost_ms[v_slice]
+                if v_slice_2d is not None:
+                    e_costs = d_ms + v_slice_2d
+                    modeled_vec = d_ms + v_cost
+                else:
+                    e_costs = d_ms + verify_cost_ms[v_slice]
                 draft_budget = int(
                     np.argmax(num_tokens_to_estimated_accepted_tokens / e_costs)
                 )
             else:
                 draft_budget = verify_cut(
-                    scores, num_non_draft_tokens_total, verify_cost_ms
+                    scores,
+                    num_non_draft_tokens_total,
+                    v_slice_2d if v_slice_2d is not None else verify_cost_ms,
                 )
         else:
             draft_budget = int(

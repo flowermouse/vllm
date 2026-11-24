@@ -37,6 +37,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import prepare_dflash_inpu
 logger = init_logger(__name__)
 
 BUCKETS = (
+    8,
     16,
     32,
     64,
@@ -460,14 +461,21 @@ class ElasticFullGraphs:
         )
         fresh_mask = np.zeros(num_reqs, dtype=bool)
         fresh_mask[dec_mask] = d_new | (self._host_new_cd[d_slots] > 0)
+        floor7 = elastic_plan.is_floor7()
+        fresh_q = 16 if (not floor7 or num_reqs <= 8) else 8
+        fresh_d = fresh_q - 1
         if stale_uq is not None:
-            q_est = np.where(fresh_mask, 16, stale_uq[slots])
-            d_est = np.where(fresh_mask, 15, stale_d[slots])
+            q_est = np.where(fresh_mask, fresh_q, stale_uq[slots])
+            d_est = np.where(fresh_mask, fresh_d, stale_d[slots])
         else:
-            q_est = np.full(num_reqs, 16, dtype=np.int32)
-            d_est = np.full(num_reqs, 15, dtype=np.int32)
-        q_est = np.where(prefill_np, 0, q_est).astype(np.int32)
-        d_est = np.where(prefill_np, 0, d_est).astype(np.int32)
+            q_est = np.full(num_reqs, fresh_q, dtype=np.int32)
+            d_est = np.full(num_reqs, fresh_d, dtype=np.int32)
+        if floor7:
+            q_est = np.where(prefill_np, 0, np.maximum(q_est, 8)).astype(np.int32)
+            d_est = np.where(prefill_np, 0, np.maximum(d_est, 7)).astype(np.int32)
+        else:
+            q_est = np.where(prefill_np, 0, q_est).astype(np.int32)
+            d_est = np.where(prefill_np, 0, d_est).astype(np.int32)
 
         self._host_d[slots] = d_est
         self._host_decode[slots] = ~prefill_np
@@ -495,7 +503,8 @@ class ElasticFullGraphs:
 
         growth = max(0, q_tot_est - self._prev_q_est)
         self._prev_q_est = q_tot_est
-        if q_tot_est >= r_max * 16:
+        base_q = 8 * int(dec_mask.sum()) if floor7 else 0
+        if q_tot_est >= r_max * 16 or floor7 and q_tot_est <= base_q and growth == 0:
             headroom = 0
         elif growth > 0:
             headroom = min(128, growth + 32)
@@ -503,7 +512,8 @@ class ElasticFullGraphs:
             headroom = 128
         else:
             headroom = 32 if q_tot_est <= 384 else 64
-        bucket = pick_bucket(min(q_tot_est + headroom, r_max * 16), r_max)
+        target_q = max(base_q, min(q_tot_est + headroom, r_max * 16))
+        bucket = pick_bucket(target_q, r_max)
         r_pad = (
             32
             if (
@@ -679,6 +689,9 @@ class ElasticFullGraphs:
         rmin = min(r, q_pad // 16)
         self.q.zero_()
         self.q[:rmin] = 16
+        rem = q_pad - rmin * 16
+        if rem > 0 and rmin < r:
+            self.q[rmin] = rem
         self.live.fill_(r)
         self.batch_pos[:r] = torch.arange(r, device=spec.device)
         self.batch_qsl[: r + 1] = torch.arange(r + 1, device=spec.device)
@@ -903,8 +916,11 @@ class ElasticFullGraphs:
         )
         score = torch.cat((hidden, h_s), dim=-1) @ gate["W_o"].T + gate["b_o"]
         raw = (gate["C"] * torch.sigmoid(score)).contiguous()
-        delta = torch.empty_like(raw)
-        _pava4_kernel[(r,)](raw, delta)
+        if elastic_plan.is_floor7():
+            delta = raw
+        else:
+            delta = torch.empty_like(raw)
+            _pava4_kernel[(r,)](raw, delta)
         live_mask = self.live_arange[:r] < self.live
         decode = (self.num_sampled[:r] > 0) & live_mask
         hit = spec._gpu_hit[slots] > 0.5

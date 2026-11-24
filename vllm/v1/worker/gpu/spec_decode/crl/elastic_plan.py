@@ -48,10 +48,36 @@ def verify_mode() -> str:
     return os.environ.get("VLLM_ELASTIC_VERIFY", "lambda")
 
 
+def is_floor7() -> bool:
+    """Floor-7 upgrade auction mode: lock active decode requests at d_base=7 and only auction 7->11, 11->15."""
+    return os.environ.get("VLLM_ELASTIC_FLOOR7", "0") == "1"
+
+
 def publish_verify_cost(table: np.ndarray) -> None:
     global _verify_cost
     _verify_cost = np.asarray(table, dtype=np.float64)
     _sync_gpu_tables()
+
+
+_GPU_VCOST_PIN = None
+
+
+def publish_verify_cost_async(table: np.ndarray) -> None:
+    """Non-blocking H2D update of the fixed-address GPU verify cost table (CUDA-graph safe)."""
+    global _verify_cost, _GPU_VCOST_PIN
+    _verify_cost = np.asarray(table, dtype=np.float64)
+    if not _GPU_CACHE:
+        return
+    import torch
+
+    if _GPU_VCOST_PIN is None:
+        _GPU_VCOST_PIN = torch.empty(
+            _GPU_VCOST_CAP, dtype=torch.float32, pin_memory=True
+        )
+    v_pad = _pad_1d(_verify_cost, _GPU_VCOST_CAP)
+    _GPU_VCOST_PIN.copy_(torch.from_numpy(v_pad))
+    for _k, (_caps, _rows_t, _ms_t, vcost_t, _has_vc) in _GPU_CACHE.items():
+        vcost_t.copy_(_GPU_VCOST_PIN, non_blocking=True)
 
 
 def verify_cost_ready() -> bool:
@@ -490,9 +516,82 @@ def choose_total_torch(delta, decode, p_next: int, hit, prev_d, cold):
 
     device = delta.device
     R = delta.shape[0]
-    N = 4 * R
     caps, rows_t, ms_t, vcost_t, has_vc = _gpu_tables(device)
     option = verify_mode() != "off"
+
+    if is_floor7():
+        from vllm.v1.worker.gpu.spec_decode.crl.fused import (
+            _elastic_floor7_auction_kernel,
+        )
+
+        # delta here is raw [R, 4] (d0: pos 1..3, d1: pos 4..7, d2: pos 8..11, d3: pos 12..15)
+        d0 = delta[:, 0]
+        d1 = delta[:, 1]
+        d2 = delta[:, 2]
+        d3 = delta[:, 3]
+        dec_f = decode.to(torch.float32)
+        y0 = ((1.0 + d0 + d1) * dec_f).sum(dim=0, keepdim=True)
+        if option:
+            v0_req = torch.clamp(d0 / ALPHA_PASS, max=3.0) + torch.clamp(
+                d1 / ALPHA_PASS, max=4.0
+            )
+        else:
+            v0_req = torch.full_like(d0, 7.0)
+        d0_ver = (v0_req * dec_f).sum(dim=0, keepdim=True)
+
+        avg23 = 0.5 * (d2 + d3)
+        t0 = torch.where(d3 > d2, avg23, d2)
+        t1 = torch.where(d3 > d2, avg23, d3)
+        tickets = torch.stack((t0, t1), dim=1)  # [R, 2]
+        t_ver = (
+            torch.clamp(tickets / ALPHA_PASS, max=4.0)
+            if option
+            else torch.full_like(tickets, 4.0)
+        )
+        valid_ext = decode[:, None] & (tickets > 0)
+        flat_v = torch.where(valid_ext, tickets, 0.0).reshape(-1)
+        flat_ver = torch.where(valid_ext, t_ver, 0.0).reshape(-1)
+        key = torch.where(valid_ext.reshape(-1), flat_v, -1.0e30)
+        sv, order = torch.sort(key, descending=True)
+        sver = flat_ver[order]
+        sval = valid_ext.reshape(-1)[order]
+
+        g_base = torch.where(
+            decode,
+            torch.full((R,), 2, device=device, dtype=torch.int32),
+            torch.zeros((R,), device=device, dtype=torch.int32),
+        )
+        lam = torch.empty(1, device=device, dtype=torch.float32)
+        p_next_t = torch.full((1,), float(p_next), device=device, dtype=torch.float32)
+        N_ext = 2 * R
+        _elastic_floor7_auction_kernel[(1,)](
+            sv,
+            sver,
+            sval,
+            order,
+            y0,
+            d0_ver,
+            rows_t,
+            ms_t,
+            vcost_t,
+            g_base,
+            g_base,
+            lam,
+            decode,
+            p_next_t,
+            float(_VERIFY_FLOOR_MS),
+            float(_VERIFY_PER_TOKEN_MS),
+            R,
+            N_ext,
+            M=rows_t.numel(),
+            V_LEN=vcost_t.numel(),
+            HAS_VCOST=1 if has_vc else 0,
+            BLOCK=256,
+            HAS_GU=0,
+        )
+        return (g_base * 4).to(torch.int32), lam[0]
+
+    N = 4 * R
     verified = (
         torch.minimum(caps, delta / ALPHA_PASS) if option else caps.expand_as(delta)
     )
@@ -603,9 +702,95 @@ def choose_total_graph(
 
     device = delta.device
     R = delta.shape[0]
-    N = 4 * R
     caps, rows_t, ms_t, vcost_t, has_vc = _gpu_tables(device)
     option = verify_mode() != "off"
+
+    if is_floor7():
+        from vllm.v1.worker.gpu.spec_decode.crl.fused import (
+            _elastic_floor7_auction_kernel,
+        )
+
+        # delta here is raw [R, 4] (d0: pos 1..3, d1: pos 4..7, d2: pos 8..11, d3: pos 12..15)
+        d0 = delta[:, 0]
+        d1 = delta[:, 1]
+        d2 = delta[:, 2]
+        d3 = delta[:, 3]
+        dec_f = decode.to(torch.float32)
+        y0 = ((1.0 + d0 + d1) * dec_f).sum(dim=0, keepdim=True)
+        if option:
+            v0_req = torch.clamp(d0 / ALPHA_PASS, max=3.0) + torch.clamp(
+                d1 / ALPHA_PASS, max=4.0
+            )
+        else:
+            v0_req = torch.full_like(d0, 7.0)
+        d0_ver = (v0_req * dec_f).sum(dim=0, keepdim=True)
+
+        avg23 = 0.5 * (d2 + d3)
+        t0 = torch.where(d3 > d2, avg23, d2)
+        t1 = torch.where(d3 > d2, avg23, d3)
+        tickets = torch.stack((t0, t1), dim=1)  # [R, 2]
+        t_ver = (
+            torch.clamp(tickets / ALPHA_PASS, max=4.0)
+            if option
+            else torch.full_like(tickets, 4.0)
+        )
+        valid_ext = decode[:, None] & (tickets > 0)
+        flat_v = torch.where(valid_ext, tickets, 0.0).reshape(-1)
+        flat_ver = torch.where(valid_ext, t_ver, 0.0).reshape(-1)
+        key = torch.where(valid_ext.reshape(-1), flat_v, -1.0e30)
+        sv, order = torch.sort(key, descending=True)
+        sver = flat_ver[order]
+        sval = valid_ext.reshape(-1)[order]
+
+        g_base = torch.where(
+            decode,
+            torch.full((R,), 2, device=device, dtype=torch.int32),
+            torch.zeros((R,), device=device, dtype=torch.int32),
+        )
+        g_uncapped = g_base.clone()
+        N_ext = 2 * R
+        _elastic_floor7_auction_kernel[(1,)](
+            sv,
+            sver,
+            sval,
+            order,
+            y0,
+            d0_ver,
+            rows_t,
+            ms_t,
+            vcost_t,
+            g_base,
+            g_uncapped,
+            lam_out,
+            decode,
+            p_next_t,
+            float(_VERIFY_FLOOR_MS),
+            float(_VERIFY_PER_TOKEN_MS),
+            R,
+            N_ext,
+            M=rows_t.numel(),
+            V_LEN=vcost_t.numel(),
+            HAS_VCOST=1 if has_vc else 0,
+            BLOCK=256,
+            MAX_Q_ROWS=max_q_rows,
+            HAS_GU=1,
+        )
+        _elastic_cap_publish_kernel[(1,)](
+            g_base,
+            g_base,
+            g_uncapped,
+            slots,
+            q_out,
+            d_slot,
+            uq_slot,
+            live_t,
+            R,
+            MAX_Q_ROWS=max_q_rows,
+            BLOCK=128,
+        )
+        return
+
+    N = 4 * R
     verified = (
         torch.minimum(caps, delta / ALPHA_PASS) if option else caps.expand_as(delta)
     )

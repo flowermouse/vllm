@@ -152,10 +152,16 @@ class CRLSpeculator(DFlash2Speculator):
                 torch.from_numpy(f["beta"]).float(),
             )
         d = self.draft_model_config.hf_config.hidden_size
-        if w.shape != (d,) or beta.shape != (self.num_speculative_steps,):
+        if (
+            w.shape != (d,)
+            or beta.ndim != 1
+            or beta.shape[0] < self.num_speculative_steps
+        ):
             raise ValueError(
                 f"{path}: w {tuple(w.shape)} / beta {tuple(beta.shape)} do not match hidden {d} / {self.num_speculative_steps} rows"
             )
+        if beta.shape[0] > self.num_speculative_steps:
+            beta = beta[: self.num_speculative_steps].contiguous()
         self._null_w = w.to(self.device)
         self._null_beta = beta.to(self.device)
         ka = int(self.draft_model_config.hf_config.dflash_config["crl_pred_topk"])
