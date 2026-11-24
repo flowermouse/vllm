@@ -138,19 +138,27 @@ class CRLSpeculator(DFlash2Speculator):
             raise ValueError(
                 "crl_confidence='null' needs the fused refinement stage (VLLM_CRL_FUSED=1)"
             )
-        # (an .npz, not a .safetensors: the weight loader of the draft model reads every *.safetensors of the directory as model weights)
-        path = os.path.join(self.draft_model_config.model, "null_probe.npz")
-        if not os.path.exists(path):
-            raise ValueError(
-                f"crl_confidence='null' needs the Null Candidate probe {path} (AngelSpec: tools/sim_trajectory.py --null-probe-train)"
-            )
-        import numpy as np
+        embedded = getattr(getattr(self.model, "model", None), "null_probe", None)
+        if embedded is not None:
+            w = embedded.weight.detach().float()
+            beta = embedded.bias.detach().float()
+            src = "model.safetensors (model.null_probe)"
+        else:
+            # Legacy fallback: external null_probe.npz next to hf_final
+            path = os.path.join(self.draft_model_config.model, "null_probe.npz")
+            if not os.path.exists(path):
+                raise ValueError(
+                    f"crl_confidence='null' needs model.null_probe in model.safetensors or {path} "
+                    "(AngelSpec: Stage 1 joint training or tools/sim_trajectory.py --null-probe-train)"
+                )
+            import numpy as np
 
-        with np.load(path) as f:
-            w, beta = (
-                torch.from_numpy(f["w"]).float(),
-                torch.from_numpy(f["beta"]).float(),
-            )
+            with np.load(path) as f:
+                w, beta = (
+                    torch.from_numpy(f["w"]).float(),
+                    torch.from_numpy(f["beta"]).float(),
+                )
+            src = path
         d = self.draft_model_config.hf_config.hidden_size
         if (
             w.shape != (d,)
@@ -158,7 +166,7 @@ class CRLSpeculator(DFlash2Speculator):
             or beta.shape[0] < self.num_speculative_steps
         ):
             raise ValueError(
-                f"{path}: w {tuple(w.shape)} / beta {tuple(beta.shape)} do not match hidden {d} / {self.num_speculative_steps} rows"
+                f"{src}: w {tuple(w.shape)} / beta {tuple(beta.shape)} do not match hidden {d} / {self.num_speculative_steps} rows"
             )
         if beta.shape[0] > self.num_speculative_steps:
             beta = beta[: self.num_speculative_steps].contiguous()
@@ -173,7 +181,7 @@ class CRLSpeculator(DFlash2Speculator):
             device=self.device,
         )
         logger.info(
-            "%s: Null Candidate probe loaded from %s", self._speculator_name, path
+            "%s: Null Candidate probe loaded from %s", self._speculator_name, src
         )
 
     def _calib_save(self) -> None:

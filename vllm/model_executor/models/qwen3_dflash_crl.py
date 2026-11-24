@@ -134,6 +134,22 @@ class DFlashCRLQwen3Model(DFlashQwen3Model):
         # same parameter name / path as the stock final norm, so the checkpoint's ``norm.weight`` still loads
         norm = _NormWithPre(config.hidden_size, eps=config.rms_norm_eps)
         self.norm = norm
+        self.null_probe: nn.Module | None = None
+        if bool(draft_config.get("crl_null_probe", False)):
+            n_steps = int(
+                draft_config.get(
+                    "crl_null_probe_steps",
+                    int(getattr(config, "block_size", 0) or 0) - 1,
+                )
+            )
+            if n_steps < 1:
+                raise ValueError(
+                    f"crl_null_probe requires crl_null_probe_steps >= 1, got {n_steps}"
+                )
+            probe = nn.Module()
+            probe.weight = nn.Parameter(torch.zeros(config.hidden_size))
+            probe.bias = nn.Parameter(torch.zeros(n_steps))
+            self.null_probe = probe
 
 
 class DFlashCRLQwen3ForCausalLM(DFlashQwen3ForCausalLM):
@@ -160,7 +176,9 @@ class DFlashCRLQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         last = self.config.num_hidden_layers - 1
         prefix = f"layers.{last}.crl."
         crl_weights: list[tuple[str, torch.Tensor]] = []
+        null_weights: list[tuple[str, torch.Tensor]] = []
         seen: set[str] = set()
+        seen_null: set[str] = set()
 
         def backbone_weights():
             for name, value in weights:
@@ -170,6 +188,9 @@ class DFlashCRLQwen3ForCausalLM(DFlashQwen3ForCausalLM):
                     # q/k/v and gate/up name mapping
                     crl_weights.append((bare.removeprefix(prefix), value))
                     seen.add(bare.removeprefix(prefix))
+                elif bare.startswith("null_probe."):
+                    null_weights.append((bare.removeprefix("null_probe."), value))
+                    seen_null.add(bare.removeprefix("null_probe."))
                 else:
                     yield name, value
 
@@ -181,6 +202,18 @@ class DFlashCRLQwen3ForCausalLM(DFlashQwen3ForCausalLM):
                 f"unexpected={sorted(seen - expected)}"
             )
         AutoWeightsLoader(self.model.crl).load_weights(crl_weights)
+        if self.model.null_probe is not None:
+            expected_null = {n for n, _ in self.model.null_probe.named_parameters()}
+            if seen_null != expected_null:
+                raise ValueError(
+                    f"Null probe checkpoint coverage mismatch: missing={sorted(expected_null - seen_null)}, "
+                    f"unexpected={sorted(seen_null - expected_null)}"
+                )
+            AutoWeightsLoader(self.model.null_probe).load_weights(null_weights)
+        elif seen_null:
+            raise ValueError(
+                f"Unexpected null_probe weights without dflash_config.crl_null_probe: {sorted(seen_null)}"
+            )
 
 
 EntryClass = DFlashCRLQwen3ForCausalLM
