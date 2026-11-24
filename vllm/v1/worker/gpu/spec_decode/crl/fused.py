@@ -939,7 +939,9 @@ def _elastic_floor7_auction_kernel(
     c_ver = d0 + tl.cumsum(sver, axis=0)
     c_rows = q0 + tl.cumsum(srow, axis=0)
 
-    # Piecewise-linear t_draft(q0) and t_draft(c_rows)
+    # Discrete ceiling-bucket t_draft(ceil_bucket(q0)) and t_draft(ceil_bucket(c_rows)).
+    # Using the true CUDA Graph bucket step cost prevents 1-2 marginal requests
+    # from triggering a +64-row bucket jump (e.g. 256 -> 320, +0.41 ms) for tiny ΔY.
     r0 = tl.load(rows_ptr)
     m0 = tl.load(ms_ptr)
     td = tl.full([BLOCK], m0, dtype=tl.float32)
@@ -947,13 +949,10 @@ def _elastic_floor7_auction_kernel(
     for j in range(1, M):
         rj = tl.load(rows_ptr + j)
         mj = tl.load(ms_ptr + j)
-        span = tl.maximum(rj - r0, 1e-6)
         in_seg = (c_rows > r0) & (c_rows <= rj)
-        interp = m0 + (mj - m0) * ((c_rows - r0) / span)
-        td = tl.where(in_seg, interp, td)
+        td = tl.where(in_seg, mj, td)
         in_seg0 = (q0 > r0) & (q0 <= rj)
-        interp0 = m0 + (mj - m0) * ((q0 - r0) / span)
-        td0 = tl.where(in_seg0, interp0, td0)
+        td0 = tl.where(in_seg0, mj, td0)
         if j == M - 1:
             td = tl.where(c_rows > rj, mj, td)
             td0 = tl.where(q0 > rj, mj, td0)
