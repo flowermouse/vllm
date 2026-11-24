@@ -1036,12 +1036,15 @@ def _elastic_cap_publish_kernel(
     gb = tl.load(g_base_ptr + idx, mask=mask, other=0)
     gf = tl.load(g_floored_ptr + idx, mask=mask, other=0)
     gu = tl.load(g_uncapped_ptr + idx, mask=mask, other=0)
-    extra = tl.maximum(gf - gb, 0) * 4
-    used = tl.sum(gb * 4, axis=0)
+    base_q = tl.where(mask, gb * 4, 0)
+    cum_base = tl.cumsum(base_q, axis=0)
+    keep_base = tl.where(cum_base <= MAX_Q_ROWS, base_q, 0)
+    extra = tl.where(keep_base > 0, tl.maximum(gf - gb, 0) * 4, 0)
+    used = tl.sum(keep_base, axis=0)
     room = tl.maximum(MAX_Q_ROWS - used, 0)
     cum_extra = tl.cumsum(extra, axis=0)
     keep_extra = tl.where(cum_extra <= room, extra, 0)
-    q_final = tl.where(mask, gb * 4 + keep_extra, 0)
+    q_final = tl.where(mask, keep_base + keep_extra, 0)
     q_uncapped = gu * 4
     d_final = tl.where(q_final > 0, q_final - 1, 0)
     tl.store(q_out_ptr + idx, q_final, mask=rmask)
