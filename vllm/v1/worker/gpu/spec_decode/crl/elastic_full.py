@@ -161,6 +161,7 @@ class ElasticFullGraphs:
         self._host_req_ids = np.full(r, -1, dtype=np.int64)
         self._host_new_cd = np.zeros(r, dtype=np.int32)
         self._host_d = np.full(r, 15, dtype=np.int32)
+        self._host_slot_max_d = np.full(r, 15, dtype=np.int32)
         self._host_decode = np.ones(r, dtype=bool)
         self._host_lam = 0.0
         self._prev_q_est = 0
@@ -481,14 +482,13 @@ class ElasticFullGraphs:
         self._host_decode[slots] = ~prefill_np
         self._host_lam = stale_lam
         self._async_active = True
-        if spec.enable_adaptive_verification and elastic_plan.verify_mode() != "off":
-            d_pub = np.where(prefill_np, 0, self.steps).astype(np.int32)
-        else:
-            d_pub = d_est
-        elastic_plan.publish_depths(slots, d_pub, stale_lam, r_max)
 
         q_tot_est = int(q_est.sum())
         if q_tot_est == 0:
+            self._host_slot_max_d[slots] = 0
+            elastic_plan.publish_depths(
+                slots, np.zeros(num_reqs, dtype=np.int32), stale_lam, r_max
+            )
             spec._store_hidden_states(
                 num_target_tokens, last_hidden_states, aux_hidden_states
             )
@@ -504,7 +504,9 @@ class ElasticFullGraphs:
         growth = max(0, q_tot_est - self._prev_q_est)
         self._prev_q_est = q_tot_est
         base_q = 8 * int(dec_mask.sum()) if floor7 else 0
-        if q_tot_est >= r_max * 16 or floor7 and q_tot_est <= base_q and growth == 0:
+        # stale_uq is already uncapped (HAS_GU=1), so q_tot_est <= base_q means
+        # zero requests wanted >8 rows on GPU even if num_dec grew (e.g. 31 -> 32).
+        if q_tot_est >= r_max * 16 or (floor7 and q_tot_est <= base_q):
             headroom = 0
         elif growth > 0:
             headroom = min(128, growth + 32)
@@ -514,6 +516,22 @@ class ElasticFullGraphs:
             headroom = 32 if q_tot_est <= 384 else 64
         target_q = max(base_q, min(q_tot_est + headroom, r_max * 16))
         bucket = pick_bucket(target_q, r_max)
+        if floor7:
+            extra_rows = max(0, bucket - base_q)
+            step_max_d = (
+                7
+                if extra_rows < 4
+                else (11 if extra_rows < 8 else self.steps)
+            )
+        else:
+            step_max_d = self.steps
+        slot_max_d = np.where(prefill_np, 0, step_max_d).astype(np.int32)
+        self._host_slot_max_d[slots] = slot_max_d
+        if spec.enable_adaptive_verification and elastic_plan.verify_mode() != "off":
+            d_pub = slot_max_d
+        else:
+            d_pub = d_est
+        elastic_plan.publish_depths(slots, d_pub, stale_lam, r_max)
         r_pad = (
             32
             if (

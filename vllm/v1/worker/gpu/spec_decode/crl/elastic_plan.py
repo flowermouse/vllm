@@ -532,9 +532,7 @@ def choose_total_torch(delta, decode, p_next: int, hit, prev_d, cold):
         dec_f = decode.to(torch.float32)
         y0 = ((1.0 + d0 + d1) * dec_f).sum(dim=0, keepdim=True)
         if option:
-            v0_req = torch.clamp(d0 / ALPHA_PASS, max=3.0) + torch.clamp(
-                d1 / ALPHA_PASS, max=4.0
-            )
+            v0_req = torch.clamp(2.5 + 0.68 * (d0 + d1), max=7.0)
         else:
             v0_req = torch.full_like(d0, 7.0)
         d0_ver = (v0_req * dec_f).sum(dim=0, keepdim=True)
@@ -544,7 +542,11 @@ def choose_total_torch(delta, decode, p_next: int, hit, prev_d, cold):
         t1 = torch.where(d3 > d2, avg23, d3)
         tickets = torch.stack((t0, t1), dim=1)  # [R, 2]
         t_ver = (
-            torch.clamp(tickets / ALPHA_PASS, max=4.0)
+            torch.where(
+                tickets > 0,
+                torch.clamp(1.25 + tickets, max=4.0),
+                torch.zeros_like(tickets),
+            )
             if option
             else torch.full_like(tickets, 4.0)
         )
@@ -718,9 +720,7 @@ def choose_total_graph(
         dec_f = decode.to(torch.float32)
         y0 = ((1.0 + d0 + d1) * dec_f).sum(dim=0, keepdim=True)
         if option:
-            v0_req = torch.clamp(d0 / ALPHA_PASS, max=3.0) + torch.clamp(
-                d1 / ALPHA_PASS, max=4.0
-            )
+            v0_req = torch.clamp(2.5 + 0.68 * (d0 + d1), max=7.0)
         else:
             v0_req = torch.full_like(d0, 7.0)
         d0_ver = (v0_req * dec_f).sum(dim=0, keepdim=True)
@@ -730,7 +730,11 @@ def choose_total_graph(
         t1 = torch.where(d3 > d2, avg23, d3)
         tickets = torch.stack((t0, t1), dim=1)  # [R, 2]
         t_ver = (
-            torch.clamp(tickets / ALPHA_PASS, max=4.0)
+            torch.where(
+                tickets > 0,
+                torch.clamp(1.25 + tickets, max=4.0),
+                torch.zeros_like(tickets),
+            )
             if option
             else torch.full_like(tickets, 4.0)
         )

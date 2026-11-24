@@ -958,6 +958,9 @@ def _elastic_floor7_auction_kernel(
             td0 = tl.where(q0 > rj, mj, td0)
         r0 = rj
         m0 = mj
+    # At moderate/high concurrency (R >= 16), leaving the all-d=7 fast-path
+    # (max_query_len=8, d_pub=7) incurs ~0.40 ms 15-step scheduling/logits overhead.
+    td = tl.where((r_f >= 16.0) & (c_rows > q0), td + 0.40, td)
 
     if HAS_VCOST:
         n1 = tl.minimum(

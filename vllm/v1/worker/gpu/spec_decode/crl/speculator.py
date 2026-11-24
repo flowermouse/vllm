@@ -130,15 +130,16 @@ class CRLSpeculator(DFlash2Speculator):
             # the confidence is computed in the draft graph (below), not by the online estimator
             self.use_acceptance_estimator = False
             if self._conf_mode == "null":
-                self._load_null_probe()
+                self._load_null_probe(model)
         return model
 
-    def _load_null_probe(self) -> None:
+    def _load_null_probe(self, draft_model=None) -> None:
         if not self._fused:
             raise ValueError(
                 "crl_confidence='null' needs the fused refinement stage (VLLM_CRL_FUSED=1)"
             )
-        embedded = getattr(getattr(self.model, "model", None), "null_probe", None)
+        m_obj = draft_model if draft_model is not None else getattr(self, "model", None)
+        embedded = getattr(getattr(m_obj, "model", None), "null_probe", None)
         if embedded is not None:
             w = embedded.weight.detach().float()
             beta = embedded.bias.detach().float()
@@ -408,6 +409,11 @@ class CRLSpeculator(DFlash2Speculator):
                 self.enable_adaptive_verification
                 and elastic_plan.verify_mode() != "off"
             ):
+                slot_max = getattr(ef, "_host_slot_max_d", None)
+                if slot_max is not None:
+                    return np.where(
+                        ef._host_decode[slots], slot_max[slots], 0
+                    ).astype(np.int32)
                 return np.where(
                     ef._host_decode[slots], self.num_speculative_steps, 0
                 ).astype(np.int32)
