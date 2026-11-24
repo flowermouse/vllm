@@ -165,6 +165,10 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self._uniform_conv_pos: dict[int, torch.Tensor] = {
+            q: (torch.arange(self.max_num_tokens, device=device, dtype=torch.int32) % q)
+            for q in range(1, self.num_query_per_req + 1)
+        }
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -921,10 +925,16 @@ class DFlashSpeculator(DraftModelSpeculator):
         if dummy_run and dp_sync_state is not None:
             num_reqs = min(num_reqs, dp_sync_state.num_reqs)
         num_target_tokens = input_batch.num_tokens
-        num_query_tokens = num_reqs * self.num_query_per_req
+        step_spec = (
+            self.num_speculative_steps
+            if (num_speculative_tokens is None or dummy_run or is_profile)
+            else int(num_speculative_tokens)
+        )
+        step_q = 1 + step_spec
+        num_query_tokens = num_reqs * step_q
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
-            max_seq_len + self.num_query_per_req, self.max_model_len
+            max_seq_len + step_q, self.max_model_len
         )
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
@@ -1028,8 +1038,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.dcp_size,
                 self.block_tables.cp_interleave,
                 self.parallel_drafting_token_id,
-                self.num_query_per_req,
-                self.num_speculative_steps,
+                step_q,
+                step_spec,
                 self.max_num_reqs,
                 self.max_num_tokens,
                 self.max_model_len,
@@ -1051,17 +1061,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             self._build_uniform_batch_dp_sync(
                 dp_sync_state,
                 num_reqs,
-                self.num_query_per_req,
+                step_q,
             )
             if dp_sync_state is not None
             else (None, num_query_tokens)
         )
-        # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
+        # Every DFlash step has exactly step_q tokens, so we can use FULL CGs
         batch_desc, batch_sync = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
             num_reqs,
             num_batch_tokens,
-            uniform_token_count=self.num_query_per_req,
+            uniform_token_count=step_q,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
@@ -1099,9 +1109,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             draft_attn_metadata = self._build_uniform_attn_metadata(
                 num_reqs=num_reqs,
                 batch_desc=batch_desc,
-                num_query_per_req=self.num_query_per_req,
+                num_query_per_req=step_q,
                 seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
-                step=self.num_query_per_req,
+                step=step_q,
                 causal=self._group_causal,
             )
 

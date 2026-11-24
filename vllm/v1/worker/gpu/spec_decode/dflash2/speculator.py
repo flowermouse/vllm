@@ -26,6 +26,7 @@ def _selector_walk_kernel(
     row_limits_ptr,
     pad_token,
     num_steps: tl.constexpr,
+    tokens_stride: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SAMPLE_PROBABILISTIC: tl.constexpr,
@@ -81,7 +82,7 @@ def _selector_walk_kernel(
         # the next step embeds whatever was scheduled. They carry no proposal, so a
         # fixed-horizon verify rejects them; the prefix was sampled from this forward.
         token = tl.where(live, drawn, pad_token)
-        tl.store(tokens_ptr + flat, token, mask=valid)
+        tl.store(tokens_ptr + row * tokens_stride + step, token, mask=valid)
         previous = tl.where(live, index, previous)
 
 
@@ -97,6 +98,7 @@ def _cache_draft_logits_kernel(
     row_limits_ptr,
     pad_token,
     num_steps: tl.constexpr,
+    cache_steps: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_K: tl.constexpr,
     CACHE_NUM_SHARDS: tl.constexpr,
@@ -119,7 +121,7 @@ def _cache_draft_logits_kernel(
     )
     mask = base_mask & drafted
     candidate_base = flat * top_k
-    cache_base = (req_state * num_steps + step) * top_k
+    cache_base = (req_state * cache_steps + step) * top_k
     old_token_ids = tl.load(cached_candidate_ptr + cache_base + offsets, mask=base_mask)
     logits_base = (
         draft_logits_ptr
@@ -166,7 +168,10 @@ class CandidateSampler:
         draft_logits_shard_idx: int = 0,
         row_limits: torch.Tensor | None = None,
         pad_token: int = 0,
+        active_steps: int | None = None,
     ) -> None:
+        steps = self.num_steps if active_steps is None else active_steps
+        tokens_stride = int(draft_tokens.stride(0))
         candidate_ids = candidate_ids.contiguous()
         sample_pos = sample_pos.contiguous()
         idx_mapping = idx_mapping.contiguous()
@@ -183,7 +188,8 @@ class CandidateSampler:
             self.scores,
             row_limits if has_limit else draft_tokens,
             pad_token,
-            num_steps=self.num_steps,
+            num_steps=steps,
+            tokens_stride=tokens_stride,
             top_k=self.top_k,
             BLOCK_K=block_k,
             SAMPLE_PROBABILISTIC=draft_logits is not None,
@@ -195,13 +201,14 @@ class CandidateSampler:
         if draft_logits is not None:
             self._cache_draft_logits(
                 candidate_ids,
-                num_reqs * self.num_steps,
+                num_reqs * steps,
                 idx_mapping,
                 draft_logits,
                 draft_logits_num_shards,
                 draft_logits_shard_idx,
                 row_limits,
                 pad_token=pad_token,
+                active_steps=steps,
             )
 
     def _cache_draft_logits(
@@ -214,7 +221,9 @@ class CandidateSampler:
         draft_logits_shard_idx: int,
         row_limits: torch.Tensor | None = None,
         pad_token: int = 0,
+        active_steps: int | None = None,
     ) -> None:
+        steps = self.num_steps if active_steps is None else active_steps
         block_k = triton.next_power_of_2(self.top_k)
         has_limit = row_limits is not None
         _cache_draft_logits_kernel[(num_sample,)](
@@ -227,7 +236,8 @@ class CandidateSampler:
             draft_logits.stride(1),
             row_limits if has_limit else draft_logits,
             pad_token,
-            num_steps=self.num_steps,
+            num_steps=steps,
+            cache_steps=self.num_steps,
             top_k=self.top_k,
             BLOCK_K=block_k,
             CACHE_NUM_SHARDS=draft_logits_num_shards,
@@ -264,6 +274,17 @@ class DFlash2Speculator(DFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
+        active_q = (
+            num_tokens_padded // num_reqs if num_reqs > 0 else self.num_query_per_req
+        )
+        active_steps = max(1, active_q - 1)
+        if (
+            active_q != self.num_query_per_req
+            and active_q in getattr(self, "_uniform_conv_pos", {})
+        ):
+            self._set_conv_positions(self._uniform_conv_pos[active_q][:num_tokens_padded])
+        elif self._varlen_d is None:
+            self._set_conv_positions(None)
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -271,15 +292,15 @@ class DFlash2Speculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        num_sample = num_reqs * self.num_speculative_steps
+        num_sample = num_reqs * active_steps
         hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
-            num_reqs, self.num_speculative_steps, -1
+            num_reqs, active_steps, -1
         )
         candidate_ids, unary_logits = self.model.compute_candidates(
             hidden_states.flatten(0, 1)
         )
         candidate_ids = candidate_ids.view(
-            num_reqs, self.num_speculative_steps, self.top_k
+            num_reqs, active_steps, self.top_k
         )
         unary_logits = unary_logits.view_as(candidate_ids)
         scores = self._score_candidates(candidate_ids, unary_logits, hidden_states)
@@ -296,6 +317,7 @@ class DFlash2Speculator(DFlashSpeculator):
             self.use_fp64_gumbel,
             self.draft_logits_num_shards,
             self.draft_logits_shard_idx,
+            active_steps=active_steps,
         )
         if self.enable_adaptive_verification:
             self._predict_confidence(candidate_ids, num_reqs, num_sample)
@@ -317,9 +339,10 @@ class DFlash2Speculator(DFlashSpeculator):
         unary_logits: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        num_reqs = candidate_ids.shape[0]
+        num_reqs, steps, _ = candidate_ids.shape
+        step_q = steps + 1
         anchor_token_ids = self.input_buffers.input_ids[
-            : num_reqs * self.num_query_per_req : self.num_query_per_req
+            : num_reqs * step_q : step_q
         ]
         return self.model.model.candidate_selector(
             candidate_ids, unary_logits, hidden_states, anchor_token_ids

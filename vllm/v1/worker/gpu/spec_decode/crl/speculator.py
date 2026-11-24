@@ -1008,8 +1008,9 @@ class CRLSpeculator(DFlash2Speculator):
         h_pre = hidden_states[
             ..., d:
         ]  # [R, N, D]: the rows' last-layer outputs before the final norm
+        step_q = steps + 1
         anchor = self.input_buffers.input_ids[
-            : num_reqs * self.num_query_per_req : self.num_query_per_req
+            : num_reqs * step_q : step_q
         ]
         # Row 1 (index 0) has exactly one predecessor, the anchor token (the old layout scored it ka times with the same input and kept
         # identical copies), so a request carries 1 + (N - 1) * ka refinement queries: row 0 once, every later row once per predecessor.
@@ -1105,8 +1106,9 @@ class CRLSpeculator(DFlash2Speculator):
         hidden = hidden_states.reshape(num_reqs * steps, -1)
         # (a strided view of the input ids: the kernel indexes it as a dense [R] array)
         if anchor is None:
+            step_q = steps + 1
             anchor = self.input_buffers.input_ids[
-                : num_reqs * self.num_query_per_req : self.num_query_per_req
+                : num_reqs * step_q : step_q
             ]
         anchor = anchor.contiguous()
         if sample_pos is None:
