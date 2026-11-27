@@ -930,7 +930,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             if (num_speculative_tokens is None or dummy_run or is_profile)
             else int(num_speculative_tokens)
         )
-        step_q = 1 + step_spec
+        step_q = (
+            self.num_query_per_req
+            if step_spec == self.num_speculative_steps
+            else (
+                step_spec * self.group_size
+                if self.sample_from_anchor
+                else 1 + step_spec * self.group_size
+            )
+        )
         num_query_tokens = num_reqs * step_q
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
