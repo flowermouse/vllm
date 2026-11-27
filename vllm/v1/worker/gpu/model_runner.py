@@ -1207,7 +1207,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             for batch in self.adaptive_verification.batches_to_profile(
                                 self.cudagraph_manager.captured_token_counts()
                             ):
-                                self._dummy_run(**batch)
+                                self._dummy_run(
+                                    **batch, valid_dummy_state_slots=True
+                                )
                         self.adaptive_verification.set_initial_cost_curves(timings)
                         # Release the profiling runs' activations, or the
                         # allocator cache is counted as graph memory below.
@@ -1753,8 +1755,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             state_slots = torch.arange(
                 1, input_batch.num_reqs + 1, dtype=torch.int32, device=self.device
             )
+            spec_cols = max(1, getattr(self, "decode_query_len", 1))
             for block_table in block_tables:
-                block_table[:, 0].copy_(state_slots)
+                cols = min(block_table.shape[1], spec_cols)
+                block_table[:, :cols].copy_(state_slots.unsqueeze(1))
         slot_mappings = block_table_provider.get_dummy_slot_mappings(
             input_batch.num_tokens
         )
